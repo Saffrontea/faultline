@@ -1,0 +1,12 @@
+[package]
+name = "faultline-common"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+user = ["dep:aya"]
+
+[dependencies]
+aya = { workspace = true, optional = true }

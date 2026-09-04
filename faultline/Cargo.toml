@@ -1,0 +1,23 @@
+[package]
+name = "faultline"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Interactive frontend for repeatable network fault experiments"
+autobins = false
+
+[[bin]]
+name = "flt"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true, default-features = true }
+faultline-common = { path = "../faultline-common" }
+faultline-orchestrator = { path = "../faultline-orchestrator" }
+faultline-protocol = { path = "../faultline-protocol" }
+faultline-runtime = { path = "../faultline-runtime" }
+clap = { workspace = true, features = ["derive"] }
+crossterm.workspace = true
+ratatui.workspace = true
+serde_json = { workspace = true, default-features = true }
+yaml_serde.workspace = true

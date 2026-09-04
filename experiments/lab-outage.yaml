@@ -1,0 +1,33 @@
+version: 1
+name: LXC client outage
+source:
+  runtime: lxc
+  container: faultline-client
+  interface: eth0
+  lifecycle: existing
+destination:
+  selector: 10.203.0.3/32
+  protocol: tcp
+  port: 8080
+traffic:
+  kind: command
+  program: /usr/local/bin/faultline-lab
+  args:
+    - client
+    - --address
+    - 10.203.0.3:8080
+    - --requests
+    - "1"
+    - --timeout-ms
+    - "150"
+    - --require-success
+  interval_ms: 100
+profile:
+  duration_ms: 4000
+  events:
+    - at_ms: 0
+      drop_permyriad: 0
+    - at_ms: 1000
+      drop_permyriad: 10000
+    - at_ms: 2500
+      drop_permyriad: 0

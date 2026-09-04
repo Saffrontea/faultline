@@ -1,0 +1,16 @@
+[package]
+name = "faultline-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Portable experiment model, validation, and execution-plan compiler"
+
+[dependencies]
+faultline-common = { path = "../faultline-common" }
+faultline-protocol = { path = "../faultline-protocol" }
+ipnet = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, default-features = true }
+
+[dev-dependencies]
+yaml_serde.workspace = true

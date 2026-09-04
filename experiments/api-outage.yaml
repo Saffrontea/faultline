@@ -1,0 +1,34 @@
+version: 1
+name: API outage
+
+# The source is an execution concern: it tells the TUI where the transparent
+# egress hook belongs. `local` and `lxc` are accepted here as well.
+source:
+  runtime: docker
+  container: web-01
+  # Omitted interface defaults to auto and is resolved after startup.
+  lifecycle: session
+
+# The destination is deliberately not a workload. A hostname is convenient
+# authoring input and is snapshotted to IPv4/IPv6 host routes at execution.
+destination:
+  selector: api.example.com
+  resolution: snapshot
+  protocol: tcp
+  port: 443
+
+traffic:
+  kind: http
+  url: https://api.example.com/health
+  interval_ms: 1000
+  timeout_ms: 2000
+
+profile:
+  duration_ms: 10000
+  events:
+    - at_ms: 0
+      drop_permyriad: 0
+    - at_ms: 2000
+      drop_permyriad: 10000
+    - at_ms: 7000
+      drop_permyriad: 0

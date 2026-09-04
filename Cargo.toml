@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["faultline", "faultline-agent", "faultline-common", "faultline-ebpf", "faultline-engine", "faultline-lab", "faultline-orchestrator", "faultline-protocol", "faultline-runtime"]
+default-members = ["faultline", "faultline-common", "faultline-engine", "faultline-lab", "faultline-orchestrator", "faultline-protocol", "faultline-runtime"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = { version = "1", default-features = false }
+aya = { version = "0.14.0", default-features = false }
+aya-build = { version = "0.2.0", default-features = false }
+aya-ebpf = { version = "0.2.1", default-features = false }
+cargo_metadata = { version = "0.23.0", default-features = false }
+clap = { version = "4.5.20", default-features = true }
+env_logger = { version = "0.11.5", default-features = false }
+ipnet = { version = "2.11.0", default-features = false }
+libc = { version = "0.2.159", default-features = false }
+log = { version = "0.4.22", default-features = false }
+object = { version = "0.39.1", default-features = false, features = ["read_core", "elf"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.29.0", default-features = false, features = ["events"] }
+rmp-serde = { version = "1.3.0", default-features = false }
+serde = { version = "1.0", default-features = false }
+serde_json = { version = "1.0", default-features = false }
+tokio = { version = "1.40.0", default-features = false }
+yaml_serde = { version = "0.10.3", default-features = false }
+which = { version = "6.0.0", default-features = false }
+
+[profile.release.package.faultline-ebpf]
+debug = 2
+codegen-units = 1
+strip = false
