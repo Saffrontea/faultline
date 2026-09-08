@@ -28,6 +28,7 @@ const ETHERTYPE_8021AD: u16 = 0x88a8;
 const ETHERNET_HEADER_LEN: usize = 14;
 const VLAN_HEADER_LEN: usize = 4;
 const MAX_VLAN_DEPTH: usize = 2;
+const CAS_RETRIES: usize = 2;
 
 // This value lives in a shared (not per-CPU) map. Keeping the state global makes
 // hash and Gilbert-Elliott sequences deterministic even when one flow moves
@@ -606,10 +607,10 @@ fn reserve_delivery_time(
         )
     };
     let serialization = serialization_delay_ns(packet_len, bps);
-    // A bounded CAS loop is required by the verifier. Sixteen attempts keeps
-    // normal contention exact; if all lose, returning the observed clock is a
-    // safer conservative fallback than releasing a burst at `requested`.
-    for _ in 0..16 {
+    // Keep retries low so older verifiers do not multiply this loop with the
+    // surrounding classifier branches. Failure conservatively drops instead
+    // of releasing a burst beyond the configured rate.
+    for _ in 0..CAS_RETRIES {
         let delivery = if observed > requested {
             observed
         } else {
@@ -653,7 +654,7 @@ fn next_packet_index(flow: &FlowStateKey) -> u64 {
                 address, 0,
             )
         };
-        for _ in 0..16 {
+        for _ in 0..CAS_RETRIES {
             let next = observed.wrapping_add(1);
             let (actual, exchanged) = unsafe {
                 core::intrinsics::atomic_cxchg::<
@@ -715,7 +716,7 @@ fn next_gilbert_elliott_decision(key: &FlowStateKey, rule: &FaultRule) -> bool {
 
     // Contention is local to a single flow and rule. Bound the retries so the
     // verifier can prove termination and a hot flow cannot monopolize the hook.
-    for _ in 0..4 {
+    for _ in 0..CAS_RETRIES {
         let previous_bad = (observed & GE_BAD_BIT) != 0;
         let previous_time = (observed >> 31) & GE_TIME_MASK;
         let sequence = observed & GE_SEQUENCE_MASK;

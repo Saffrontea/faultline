@@ -285,32 +285,32 @@ fn mix(mut value: u64) -> u64 {
 
 // A bounded hash loop is compact, but when called from another bounded loop
 // older verifiers multiply the explored paths until they hit the complexity
-// limit. Fixed offsets trade a modest number of static instructions for a
-// branch-free subprogram and preserve the exact hash sequence.
+// limit. Four fixed-width words keep this subprogram branch-free and reduce
+// the number of avalanche rounds while retaining all address bits.
 #[inline(never)]
 fn hash_addresses(flow: &FlowKey, mut hash: u64) -> u64 {
-    macro_rules! mix_byte {
-        ($index:expr) => {{
-            hash = mix(hash ^ flow.source_address[$index] as u64);
-            hash = mix(hash ^ ((flow.destination_address[$index] as u64) << 1));
+    macro_rules! mix_word {
+        ($offset:expr) => {{
+            let source = u32::from_le_bytes([
+                flow.source_address[$offset],
+                flow.source_address[$offset + 1],
+                flow.source_address[$offset + 2],
+                flow.source_address[$offset + 3],
+            ]) as u64;
+            let destination = u32::from_le_bytes([
+                flow.destination_address[$offset],
+                flow.destination_address[$offset + 1],
+                flow.destination_address[$offset + 2],
+                flow.destination_address[$offset + 3],
+            ]) as u64;
+            hash = mix(hash ^ source);
+            hash = mix(hash ^ (destination << 1));
         }};
     }
-    mix_byte!(0);
-    mix_byte!(1);
-    mix_byte!(2);
-    mix_byte!(3);
-    mix_byte!(4);
-    mix_byte!(5);
-    mix_byte!(6);
-    mix_byte!(7);
-    mix_byte!(8);
-    mix_byte!(9);
-    mix_byte!(10);
-    mix_byte!(11);
-    mix_byte!(12);
-    mix_byte!(13);
-    mix_byte!(14);
-    mix_byte!(15);
+    mix_word!(0);
+    mix_word!(4);
+    mix_word!(8);
+    mix_word!(12);
     hash
 }
 
