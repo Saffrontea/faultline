@@ -104,11 +104,7 @@ pub fn edt_base_ns(now: u64, existing_tstamp: u64) -> u64 {
 // avoids combining its bounded-loop states with every caller's control flow.
 #[inline(never)]
 pub fn seeded_value(flow: &FlowKey, packet_index: u64, rule: &FaultRule, domain: u64) -> u64 {
-    let mut hash = domain ^ ((rule.seed as u64) << 32 | rule.id as u64);
-    for index in 0..16 {
-        hash = mix(hash ^ flow.source_address[index] as u64);
-        hash = mix(hash ^ ((flow.destination_address[index] as u64) << 1));
-    }
+    let mut hash = hash_addresses(flow, domain ^ ((rule.seed as u64) << 32 | rule.id as u64));
     hash ^= ((flow.source_port as u64) << 48) | ((flow.destination_port as u64) << 32);
     hash ^= (flow.protocol as u64) << 24;
     mix(hash ^ packet_index)
@@ -255,11 +251,7 @@ pub fn should_drop_hash(flow: &FlowKey, packet_index: u64, rule: &FaultRule) -> 
         return true;
     }
 
-    let mut hash = (rule.seed as u64) << 32 | rule.id as u64;
-    for index in 0..16 {
-        hash = mix(hash ^ flow.source_address[index] as u64);
-        hash = mix(hash ^ ((flow.destination_address[index] as u64) << 1));
-    }
+    let mut hash = hash_addresses(flow, (rule.seed as u64) << 32 | rule.id as u64);
     hash ^= ((flow.source_port as u64) << 48) | ((flow.destination_port as u64) << 32);
     hash ^= (flow.protocol as u64) << 24;
     hash = mix(hash ^ packet_index);
@@ -289,6 +281,37 @@ fn mix(mut value: u64) -> u64 {
     value ^= value >> 27;
     value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
+}
+
+// A bounded hash loop is compact, but when called from another bounded loop
+// older verifiers multiply the explored paths until they hit the complexity
+// limit. Fixed offsets trade a modest number of static instructions for a
+// branch-free subprogram and preserve the exact hash sequence.
+#[inline(never)]
+fn hash_addresses(flow: &FlowKey, mut hash: u64) -> u64 {
+    macro_rules! mix_byte {
+        ($index:expr) => {{
+            hash = mix(hash ^ flow.source_address[$index] as u64);
+            hash = mix(hash ^ ((flow.destination_address[$index] as u64) << 1));
+        }};
+    }
+    mix_byte!(0);
+    mix_byte!(1);
+    mix_byte!(2);
+    mix_byte!(3);
+    mix_byte!(4);
+    mix_byte!(5);
+    mix_byte!(6);
+    mix_byte!(7);
+    mix_byte!(8);
+    mix_byte!(9);
+    mix_byte!(10);
+    mix_byte!(11);
+    mix_byte!(12);
+    mix_byte!(13);
+    mix_byte!(14);
+    mix_byte!(15);
+    hash
 }
 
 #[inline(always)]
