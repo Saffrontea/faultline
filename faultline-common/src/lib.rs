@@ -100,7 +100,9 @@ pub fn edt_base_ns(now: u64, existing_tstamp: u64) -> u64 {
 /// Returns a reproducible pseudo-random value for one flow packet and purpose.
 /// Callers use different domain constants to keep independent decisions from
 /// becoming correlated while retaining seed reproducibility.
-#[inline(always)]
+// This hash is shared by several impairment decisions. Keeping it out of line
+// avoids combining its bounded-loop states with every caller's control flow.
+#[inline(never)]
 pub fn seeded_value(flow: &FlowKey, packet_index: u64, rule: &FaultRule, domain: u64) -> u64 {
     let mut hash = domain ^ ((rule.seed as u64) << 32 | rule.id as u64);
     for index in 0..16 {
@@ -241,7 +243,10 @@ pub struct FlowKey {
 ///
 /// The result depends only on the flow, packet index, and rule, making an
 /// experiment repeatable without relying on the kernel's random helper.
-#[inline(always)]
+// Keep this as a BPF subprogram. Inlining the bounded address hash loop into
+// the classifier combines its verifier states with the surrounding packet,
+// rule, and atomic-update branches on older kernels.
+#[inline(never)]
 pub fn should_drop_hash(flow: &FlowKey, packet_index: u64, rule: &FaultRule) -> bool {
     if rule.drop_permyriad == 0 {
         return false;
