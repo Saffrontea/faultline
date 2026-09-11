@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context as _, bail};
 use clap::{Parser, ValueEnum};
 use faultline_common::{FAULTLINE_AGENT_APPLICATION, FAULTLINE_ENGINE_APPLICATION};
-use faultline_protocol::{Request, encode_line};
+use faultline_protocol::{ControlTimeouts, Request, encode_line};
 
 const CAP_NET_ADMIN: u32 = 12;
 const CAP_SYS_ADMIN: u32 = 21;
@@ -60,8 +60,9 @@ struct EngineGuard {
 }
 
 enum ProxyEnd {
-    EngineClosed,
-    OutputClosed,
+    Engine,
+    Input,
+    Output,
 }
 
 impl EngineGuard {
@@ -109,6 +110,20 @@ impl EngineGuard {
 
 impl Drop for EngineGuard {
     fn drop(&mut self) {
+        // The engine owns an fq qdisc as well as BPF links. SIGKILL closes
+        // BPF descriptors but skips PacingGuard, leaving the qdisc behind.
+        // Allow bounded graceful cleanup even if the stdio consumer vanished.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) };
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => thread::sleep(Duration::from_millis(10)),
+                    Err(_) => break,
+                }
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.socket);
@@ -120,11 +135,10 @@ fn main() -> anyhow::Result<()> {
     verify_capabilities()?;
     let mut engine = EngineGuard::start(&options)?;
     match proxy(engine.connect()?)? {
-        ProxyEnd::EngineClosed => engine.wait(),
-        // The consumer went away while the engine was still running. Returning
-        // drops the guard, which terminates the engine without waiting for the
-        // stdin forwarding thread to observe EOF.
-        ProxyEnd::OutputClosed => Ok(()),
+        ProxyEnd::Engine => engine.wait(),
+        // Either half of the controller can end the session. In particular,
+        // stdin EOF must still clean up if its stdout consumer is stalled.
+        ProxyEnd::Input | ProxyEnd::Output => Ok(()),
     }
 }
 
@@ -180,10 +194,30 @@ fn install_parent_death_signal(command: &mut Command) {
 
 fn proxy(mut stream: UnixStream) -> anyhow::Result<ProxyEnd> {
     let mut request_stream = stream.try_clone()?;
-    // Dropping this handle deliberately detaches the potentially blocking
-    // stdin reader. Process exit or EngineGuard cleanup closes its socket.
-    let _input = thread::spawn(move || forward_input(&mut request_stream));
-    forward_output(&mut stream)
+    let (finished, completion) = std::sync::mpsc::channel();
+    let input_finished = finished.clone();
+    // Neither stdio half can be allowed to block observation of the other
+    // half closing. The process owns these forwarding threads; returning to
+    // main runs EngineGuard cleanup and process exit ends any blocked I/O.
+    thread::spawn(move || {
+        let result = forward_input(&mut request_stream).map(|()| ProxyEnd::Input);
+        let _ = input_finished.send(result);
+    });
+    thread::spawn(move || {
+        let _ = finished.send(forward_output(&mut stream));
+    });
+    let result = completion
+        .recv()
+        .context("stdio forwarding threads stopped")?;
+    if matches!(&result, Ok(ProxyEnd::Input)) {
+        // Preserve ordered Stop processing and final output for healthy
+        // consumers, with only a bounded grace period for stalled ones.
+        completion
+            .recv_timeout(ControlTimeouts::default().shutdown)
+            .unwrap_or(result)
+    } else {
+        result
+    }
 }
 
 fn forward_input(stream: &mut UnixStream) -> anyhow::Result<()> {
@@ -203,17 +237,17 @@ fn forward_output(stream: &mut UnixStream) -> anyhow::Result<ProxyEnd> {
     for line in BufReader::new(stream).lines() {
         let line = match line {
             Ok(line) => line,
-            Err(error) if is_disconnect(&error) => return Ok(ProxyEnd::EngineClosed),
+            Err(error) if is_disconnect(&error) => return Ok(ProxyEnd::Engine),
             Err(error) => return Err(error.into()),
         };
         if let Err(error) = writeln!(output, "{line}").and_then(|()| output.flush()) {
             if is_disconnect(&error) {
-                return Ok(ProxyEnd::OutputClosed);
+                return Ok(ProxyEnd::Output);
             }
             return Err(error.into());
         }
     }
-    Ok(ProxyEnd::EngineClosed)
+    Ok(ProxyEnd::Engine)
 }
 
 fn is_disconnect(error: &std::io::Error) -> bool {
@@ -259,6 +293,113 @@ mod tests {
     use super::*;
 
     const PDEATH_HELPER_ENV: &str = "FAULTLINE_AGENT_PDEATH_HELPER_FILE";
+    const PROXY_HELPER_ENV: &str = "FAULTLINE_AGENT_PROXY_HELPER_SOCKET";
+
+    #[test]
+    fn proxy_backpressure_helper() {
+        let Some(path) = std::env::var_os(PROXY_HELPER_ENV) else {
+            return;
+        };
+        proxy(UnixStream::connect(path).unwrap()).unwrap();
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn stdin_eof_ends_proxy_even_when_stdout_is_blocked() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::UnixListener;
+
+        let path = std::env::temp_dir().join(format!(
+            "{APPLICATION_NAME}-blocked-output-{}.sock",
+            std::process::id()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::proxy_backpressure_helper"])
+            .env(PROXY_HELPER_ENV, &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Force stats backpressure while keeping the output reader open.
+        assert!(
+            unsafe {
+                libc::fcntl(
+                    child.stdout.as_ref().unwrap().as_raw_fd(),
+                    libc::F_SETPIPE_SZ,
+                    4096,
+                )
+            } >= 0
+        );
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let line = [b'x'; 4095].into_iter().chain(*b"\n").collect::<Vec<_>>();
+        loop {
+            match stream.write(&line) {
+                Ok(_) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("writing fake stats: {error}"),
+            }
+        }
+        drop(child.stdin.take());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_file(path).unwrap();
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "proxy hung after stdin EOF with a stalled output consumer"
+        );
+    }
+
+    #[test]
+    fn stdin_eof_preserves_final_engine_output() {
+        use std::os::unix::net::UnixListener;
+
+        let path = std::env::temp_dir().join(format!(
+            "{APPLICATION_NAME}-drain-output-{}.sock",
+            std::process::id()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::proxy_backpressure_helper"])
+            .env(PROXY_HELPER_ENV, &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        drop(child.stdin.take());
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Request>(&request).unwrap(),
+            Request::Stop { .. }
+        ));
+        thread::sleep(Duration::from_millis(50));
+        stream.write_all(b"final-engine-stats\n").unwrap();
+        drop(stream);
+        let output = child.wait_with_output().unwrap();
+        fs::remove_file(path).unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("final-engine-stats")
+        );
+    }
 
     #[test]
     fn pdeath_helper() {
@@ -299,6 +440,39 @@ mod tests {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         let _ = fs::remove_file(&marker);
         panic!("engine process {pid} survived its parent");
+    }
+
+    #[test]
+    fn engine_guard_allows_sigterm_cleanup_before_reaping() {
+        let directory = std::env::temp_dir().join(format!(
+            "{APPLICATION_NAME}-graceful-stop-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let cleaned = directory.join("cleaned");
+        let ready = directory.join("ready");
+        let child = Command::new("/bin/sh")
+            .args(["-c", "trap 'echo cleaned > \"$1\"; exit 0' TERM; echo ready > \"$2\"; while :; do sleep 0.01; done", "engine"])
+            .arg(&cleaned)
+            .arg(&ready)
+            .spawn()
+            .unwrap();
+        let guard = EngineGuard {
+            child,
+            socket: directory.join("engine.sock"),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < deadline, "helper did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(guard);
+        let did_clean = cleaned.exists();
+        fs::remove_dir_all(directory).unwrap();
+        assert!(
+            did_clean,
+            "engine was killed before its SIGTERM cleanup ran"
+        );
     }
 
     #[test]
