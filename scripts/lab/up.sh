@@ -77,8 +77,8 @@ start_container() {
     fi
 }
 
-create_container "$CLIENT" faultline-client0 10.203.0.2/24
-create_container "$SERVER" faultline-server0 10.203.0.3/24
+create_container "$CLIENT" flt-client0 10.203.0.2/24
+create_container "$SERVER" flt-server0 10.203.0.3/24
 start_container "$CLIENT"
 start_container "$SERVER"
 

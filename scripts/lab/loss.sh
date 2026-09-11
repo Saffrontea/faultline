@@ -56,13 +56,13 @@ trap cleanup EXIT INT TERM
 
 if [ -n "$SCENARIO" ]; then
     RUST_LOG=info "$FAULTLINE_ENGINE" \
-        --interface faultline-client0 \
+        --interface flt-client0 \
         --direction ingress \
         --scenario "$SCENARIO" \
         --stats-format json >"$stats_file" &
 else
     RUST_LOG=info "$FAULTLINE_ENGINE" \
-        --interface faultline-client0 \
+        --interface flt-client0 \
         --direction ingress \
         --destination 10.203.0.3/32 \
         --protocol tcp \

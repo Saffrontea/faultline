@@ -33,14 +33,14 @@ stop_faultline() {
 }
 cleanup() {
     stop_faultline
-    tc qdisc del dev faultline-server0 root handle 7fff: 2>/dev/null || true
+    tc qdisc del dev flt-server0 root handle 7fff: 2>/dev/null || true
     rm -f "$stats_file"
 }
 trap cleanup EXIT INT TERM
 
 start_egress() {
     RUST_LOG=info "$FAULTLINE_ENGINE" \
-        --interface faultline-server0 \
+        --interface flt-server0 \
         --direction egress \
         --destination 10.203.0.3/32 \
         --protocol tcp \
@@ -53,12 +53,12 @@ start_egress() {
     if ! kill -0 "$faultline_pid" 2>/dev/null; then
         wait "$faultline_pid"
     fi
-    tc qdisc show dev faultline-server0 | grep -q 'qdisc fq 7fff:'
+    tc qdisc show dev flt-server0 | grep -q 'qdisc fq 7fff:'
 }
 
 start_egress_bpf() {
     RUST_LOG=info "$FAULTLINE_ENGINE" \
-        --interface faultline-server0 \
+        --interface flt-server0 \
         --direction egress \
         --destination 10.203.0.3/32 \
         --protocol tcp \
@@ -71,7 +71,7 @@ start_egress_bpf() {
     if ! kill -0 "$faultline_pid" 2>/dev/null; then
         wait "$faultline_pid"
     fi
-    if tc qdisc show dev faultline-server0 | grep -q 'qdisc fq 7fff:'; then
+    if tc qdisc show dev flt-server0 | grep -q 'qdisc fq 7fff:'; then
         echo "BPF-only impairment unexpectedly installed fq" >&2
         exit 1
     fi
@@ -96,7 +96,7 @@ assert_stat_zero() {
 }
 
 assert_pacing_removed() {
-    if tc qdisc show dev faultline-server0 | grep -q 'qdisc fq 7fff:'; then
+    if tc qdisc show dev flt-server0 | grep -q 'qdisc fq 7fff:'; then
         echo "faultline-engine left its fq qdisc attached" >&2
         exit 1
     fi
@@ -160,7 +160,7 @@ assert_pacing_removed
 
 echo "LXC lab: outage window"
 RUST_LOG=info "$FAULTLINE_ENGINE" \
-    --interface faultline-client0 \
+    --interface flt-client0 \
     --direction ingress \
     --destination 10.203.0.3/32 \
     --protocol tcp \

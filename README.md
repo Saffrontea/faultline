@@ -290,7 +290,7 @@ profileは複数の完全なrulesetを時間軸に並べたversioned timelineで
 atomicに切り替わります。最後のeventは`duration_ms`まで有効です。
 
 ```bash
-sudo flt local://faultline-client0 --profile profiles/brief-outage.yaml
+sudo flt local://flt-client0 --profile profiles/brief-outage.yaml
 mise run lab:profile
 ```
 

@@ -24,7 +24,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"$TUI" local://faultline-client0 \
+"$TUI" local://flt-client0 \
     --agent "$AGENT" \
     --engine "$ENGINE" \
     --direction ingress \

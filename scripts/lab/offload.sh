@@ -5,7 +5,7 @@ LAB_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 WORKSPACE=$(CDPATH= cd -- "$LAB_DIR/../.." && pwd)
 FAULTLINE_ENGINE=$WORKSPACE/target/release/faultline-engine
 CLIENT=faultline-client
-INTERFACE=faultline-client0
+INTERFACE=flt-client0
 UPLOAD_BYTES=${UPLOAD_BYTES:-8388608}
 LOSS_PERCENT=${LOSS_PERCENT:-2}
 stats_file=$(mktemp /tmp/faultline-offload-stats.XXXXXX)
