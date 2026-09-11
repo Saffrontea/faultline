@@ -135,7 +135,22 @@ run = "./scripts/lab/sudo.sh ./scripts/lab/impairments.sh"
 [tasks."lab:offload"]
 description = "Compare real veth upload behavior with GSO/TSO/GRO disabled and enabled"
 depends = ["lab:up"]
-run = "./scripts/lab/sudo.sh ./scripts/lab/offload.sh"
+run = './scripts/lab/sudo.sh env UPLOAD_BYTES="${UPLOAD_BYTES:-8388608}" LOSS_PERCENT="${LOSS_PERCENT:-2}" ./scripts/lab/offload.sh'
+
+[tasks."lab:load"]
+description = "Measure concurrent LXC uploads under pass, loss, and bandwidth rules"
+depends = ["lab:up"]
+run = './scripts/lab/sudo.sh env LAB_LOAD_WORKERS="${LAB_LOAD_WORKERS:-8}" LAB_LOAD_SECONDS="${LAB_LOAD_SECONDS:-10}" python3 ./scripts/lab/load.py'
+
+[tasks."lab:soak"]
+description = "Soak live rule updates, slow observers, source precedence and agent cleanup"
+depends = ["lab:up", "build-tui"]
+run = './scripts/lab/sudo.sh env LAB_SOAK_SECONDS="${LAB_SOAK_SECONDS:-120}" python3 ./scripts/lab/soak.py'
+
+[tasks."lab:soak-agent"]
+description = "Verify agent cleanup under traffic, closed pipes and stdout backpressure"
+depends = ["lab:up", "build-tui"]
+run = './scripts/lab/sudo.sh python3 ./scripts/lab/soak.py --agent-only'
 
 [tasks."lab:control"]
 description = "Exercise live Unix socket rule updates and pushed stats against the LXC dataplane"

@@ -178,6 +178,30 @@ interface RX packet/byte数を並べます。application bytesだけを不変条
 offload設定は終了時に復元されます。`ethtool`と`tcpdump`がなければ`mise run lab:install`で
 追加できます。
 
+並列転送で負荷をかける場合は `mise run lab:load` を使います。専用LXC間で既定8並列・
+各10秒のuploadを、baseline、BPF pass、1% loss、100 Mbit/s制限の順に実行します。
+転送完了待ちを含む実効throughput、成功・失敗件数、eBPF統計を
+`target/network-load-*/` に保存し、各段階でTC filter・TCX・root qdiscの復元、最後に100 requestの
+成功を確認します。実行時間には進行中のuploadの完了待ちが加わります。
+`LAB_LOAD_WORKERS`（1–32）と `LAB_LOAD_SECONDS`（1–120）で負荷を変更できます。
+これはローカルveth/LXC経路の測定で、物理NICの性能測定ではありません。
+
+継続負荷と動的な意味論の確認には次を使用します（同じlabを操作するため順に実行します）。
+
+```bash
+LAB_LOAD_WORKERS=16 LAB_LOAD_SECONDS=120 mise run lab:load
+mise run lab:soak
+```
+
+`lab:soak` は既定120秒、8並列のupload中に34件/1,024件のrulesetを入れ替えます。
+sourceの最長prefix優先、更新ackとget_stateの一致、不正更新後の状態保持、統計counterと
+deltaの整合、読み取らない16監視connectionの影響を確認します。その後100% lossと復旧、
+帯域制限中のagent stdout切断・stdin EOF・stdout詰まり中のEOF・SIGTERMでTCXとfqが片付くことを
+実通信で検査します。agent終了経路だけを再検査する場合は `mise run lab:soak-agent` を使えます。
+`LAB_SOAK_SECONDS` は10–600秒で指定でき、結果は `target/semantic-soak-*/` に保存されます。
+TCX観測のABI回帰テストは `python3 scripts/lab/test_load.py` で実行でき、rootかつlab起動中は
+ガード領域付きの実kernel queryも検査します。
+
 loss判定は次から選べます。
 
 - `--loss-algorithm hash`（既定）: 5-tuple、flow内packet sequence、rule ID、seedから
