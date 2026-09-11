@@ -3,7 +3,7 @@ use std::{io, path::PathBuf, time::Duration};
 use anyhow::{Context as _, bail};
 use aya::{
     maps::PerCpuArray,
-    programs::{SchedClassifier, TcAttachType, tc},
+    programs::{SchedClassifier, TcAttachType},
 };
 use clap::{Parser, ValueEnum};
 use faultline_common::{
@@ -22,6 +22,7 @@ use tokio::{
 pub(crate) const APPLICATION_NAME: &str = FAULTLINE_ENGINE_APPLICATION;
 
 use crate::{
+    attachment::Attachment,
     control::{ControlChannel, ControlCommand, ControlState, OutageWindow, RuleSpec},
     pacing::PacingBackend,
     rule_store::RuleStore,
@@ -31,6 +32,7 @@ use crate::{
 #[cfg(test)]
 use crate::stats::{Previous, StatsEvent, StatsSnapshot, accumulate, encode_msgpack};
 
+mod attachment;
 mod control;
 mod pacing;
 mod rule;
@@ -223,10 +225,12 @@ async fn main() -> anyhow::Result<()> {
     if !rules.apply(initial)? {
         bail!("control source stopped before attach");
     }
-    attach(&mut ebpf, &options)?;
+    let attachment = attach(&mut ebpf, &options)?;
     let pacing_required = initial_rules.iter().any(rule_requires_pacing)
         || (options.control_socket.is_some() && matches!(options.direction, Direction::Egress));
-    let _pacing_guard = PacingBackend.install(&options.interface, pacing_required)?;
+    let pacing = PacingBackend.install(&options.interface, pacing_required)?;
+    // Tuple fields drop in order: detach before removing queueing resources.
+    let _dataplane = (attachment, pacing);
     if let Some(rule) = initial_rules
         .first()
         .copied()
@@ -453,9 +457,7 @@ fn quantize_loss(percent: f64) -> u32 {
     (percent * 100.0).round() as u32
 }
 
-fn attach(ebpf: &mut aya::Ebpf, options: &Options) -> anyhow::Result<()> {
-    // Needed only for the legacy netlink path; harmless when Aya uses TCX.
-    let _ = tc::qdisc_add_clsact(&options.interface);
+fn attach(ebpf: &mut aya::Ebpf, options: &Options) -> anyhow::Result<Attachment> {
     let attach_type = match options.direction {
         Direction::Ingress => TcAttachType::Ingress,
         Direction::Egress => TcAttachType::Egress,
@@ -464,11 +466,7 @@ fn attach(ebpf: &mut aya::Ebpf, options: &Options) -> anyhow::Result<()> {
         .program_mut("faultline_classifier")
         .context("faultline_classifier program not found")?
         .try_into()?;
-    program.load()?;
-    program
-        .attach(&options.interface, attach_type)
-        .with_context(|| format!("attaching to {}", options.interface))?;
-    Ok(())
+    Attachment::attach(program, &options.interface, attach_type)
 }
 
 struct ControlLoop<'a> {

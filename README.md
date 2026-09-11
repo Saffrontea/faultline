@@ -31,6 +31,12 @@ arm64では5.18以降が必要です。flow counterはBPF ISA v3のreturn-value�
 fetchを使用するため、eBPF crateだけを`-Ctarget-cpu=v3`でbuildします。
 workspaceのrustc wrapperは既存の`sccache`等が設定されている場合もそれをchainします。
 
+Linux 6.6以降ではTCX、6.6未満では従来のTC/clsactを使用します。TCXは必須ではなく、
+最低kernel要件は上記のままです。BPFのverifier検証はqdisc変更より先に行い、従来方式で
+今回作成したclsactはattach失敗時・終了時に回収します。既存のclsactや、他のfilterが残る
+clsactは削除しません。従来方式の後片付けには `tc` を使用します。
+起動途中の失敗と既存qdiscの保持は `mise run lab:startup` で検証できます。
+
 ```console
 mise install
 mise run setup

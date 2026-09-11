@@ -1,7 +1,7 @@
 # 継続ネットワーク負荷・意味論テスト（2026-09-11）
 
 専用LXC client/server間で継続負荷をかけ、動的rule更新、障害注入、統計、agentの終了処理を検証した。
-アプリの終了処理に2件、テスト用TCX観測に1件の問題を再現・修正した。最終テストは完了。
+アプリの終了処理に2件、テスト用TCX観測に1件の問題を再現・修正した。さらに起動失敗時のqdisc所有権も修正した。
 
 ## 発見と修正
 
@@ -93,3 +93,41 @@ rootかつlab起動中で実行するとガード付きkernel queryも実施す�
 各runはホスト上の他の処理やcache状態の影響を受ける。baselineとpassの大小も変動したため、固定的なBPF overheadの推定には使わない。
 
 後片付け: 最終 `lab:down` は exit=0。専用LXCを停止しbridgeを削除した（rootfsは保持）。
+
+
+## 追加検証: ロード失敗時のqdisc復元
+
+従来コードはverifier検証より先にclsactを追加し、追加エラーも無視していた。
+`Attachment` にBPF linkと作成したclsactの所有を集め、次の順番に変更した。
+
+1. BPF verifier/loadを先に完了させる。
+2. Linux 6.6以降はTCXを選び、clsactを追加しない。
+3. 6.6未満は従来TCを使う。新規作成したclsactだけを所有し、既存のものは借用する。
+4. 失敗・終了時はBPF linkを先にdetachし、自分のclsactを回収する。他のfilterが追加されていた場合は保全する。
+5. 起動途中でfqやcontrol socket設定が失敗しても、取得済みresourceはRAIIで戻す。
+
+最低kernel要件（x86-64: 5.12、arm64: 5.18）は変更していない。
+従来TC経路は現在のkernel上で明示選択して検査しており、古いkernelを起動した試験ではない。
+clsactの回収にはtcを使い、他のfilterの有無を確認できない場合は削除を控えてwarningを出す。
+
+`mise run lab:startup` は専用dummy interfaceで次の8条件を検証して成功した（exit=0）。
+
+- 不正opcodeによる実verifier拒否でqdiscが変化しない。
+- 存在しない親へのlegacy attach失敗で新規clsactを回収する。
+- legacyの正常終了でも新規clsactを回収する。
+- 元から存在したclsactとfilterは成功時・失敗時とも保持する。
+- セッション中に追加された別のfilterを破壊しない。
+- TCX attachではqdiscを変更せず、終了後にprogramが残らない。
+- fq追加後にcontrol socketの起動を失敗させても、fqとattachを回収する。
+- 元からあるroot fqはbandwidth設定失敗時にも保持する。
+
+生ログ: `target/startup-cleanup.log`。
+
+上記のattachment修正後、16 worker × 各30秒の4ケースを再実行した
+（`target/network-load-4kdi_t0l/`、`target/load-after-startup-fix.log`）。
+baseline/pass/1% loss/100 Mbit/s制限の全uploadが成功し、全ケースで終了後の
+BPF・qdisc復元を確認した。lossはskb基準1.0093%、帯域制限時はapplication基準
+97.60 Mbit/s、pacing dropは0。復旧確認も100/100成功した。
+workspace unit tests、engine/agentのClippy、format検査も修正後に成功した。
+agent終了の4ケースも修正後に再実行して全成功した
+（`target/semantic-soak-7l_gz_82/`、`target/soak-agent-after-startup-fix.log`）。

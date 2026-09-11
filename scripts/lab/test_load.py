@@ -17,6 +17,8 @@ class QueryTests(unittest.TestCase):
 
     @unittest.skipUnless(os.geteuid() == 0, 'requires root and the running LXC lab')
     def test_repeated_kernel_queries_preserve_guard_bytes(self):
+        if tcx_program_count(INTERFACE) is None:
+            self.skipTest('TCX unavailable; lab:load observes legacy TC filters instead')
         class GuardedQuery(ctypes.Structure):
             _fields_ = [('query', BpfProgQuery), ('guard', ctypes.c_ubyte * 64)]
 
