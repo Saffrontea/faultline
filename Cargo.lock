@@ -476,6 +476,7 @@ dependencies = [
  "faultline-protocol",
  "faultline-runtime",
  "ratatui",
+ "serde",
  "serde_json",
  "yaml_serde",
 ]

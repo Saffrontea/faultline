@@ -150,6 +150,10 @@ impl BuilderApp {
 
     fn from_spec(spec: ExperimentSpec, discovery: Discovery) -> Result<Self, String> {
         spec.validate()?;
+        let destination_spec = spec.destination.as_ref().ok_or_else(|| {
+            "visual editing of named selectors is not available; edit the manifest directly"
+                .to_owned()
+        })?;
         if spec.profile.events.len() != 3 || spec.profile.events[0].at_ms != 0 {
             return Err(
                 "visual editing currently requires exactly PASS → OUTAGE → RECOVER events"
@@ -213,10 +217,9 @@ impl BuilderApp {
             workload,
             image,
             interface,
-            destination: spec.destination.selector.clone(),
-            protocol: spec.destination.protocol,
-            port: spec
-                .destination
+            destination: destination_spec.selector.clone(),
+            protocol: destination_spec.protocol,
+            port: destination_spec
                 .port
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
@@ -309,17 +312,23 @@ impl BuilderApp {
                 .map_or(EXPERIMENT_VERSION, |value| value.version),
             name: self.name.clone(),
             source,
-            destination: DestinationSpec {
+            destination: Some(DestinationSpec {
                 selector: self.destination.clone(),
                 protocol: self.protocol,
                 port,
-                resolution: self
-                    .original
-                    .as_deref()
-                    .map_or(ResolutionStrategy::Snapshot, |value| {
-                        value.destination.resolution
-                    }),
-            },
+                resolution: self.original.as_deref().map_or(
+                    ResolutionStrategy::Snapshot,
+                    |value| {
+                        value
+                            .destination
+                            .as_ref()
+                            .map_or(ResolutionStrategy::Snapshot, |destination| {
+                                destination.resolution
+                            })
+                    },
+                ),
+            }),
+            selectors: Vec::new(),
             profile,
             traffic,
             extensions: self
@@ -444,14 +453,17 @@ impl BuilderApp {
                     FaultEvent {
                         at_ms: 0,
                         fault: pass.clone(),
+                        faults: Default::default(),
                     },
                     FaultEvent {
                         at_ms: start,
                         fault: outage,
+                        faults: Default::default(),
                     },
                     FaultEvent {
                         at_ms: end,
                         fault: pass,
+                        faults: Default::default(),
                     },
                 ],
             }
@@ -838,7 +850,10 @@ mod tests {
         }
         let manifest = app.build().unwrap();
         assert_eq!(manifest.source.target_uri(), "docker://web-01/auto");
-        assert_eq!(manifest.destination.selector, "api.example.test");
+        assert_eq!(
+            manifest.destination.as_ref().unwrap().selector,
+            "api.example.test"
+        );
         assert_eq!(manifest.profile.events[1].fault.drop_permyriad, 10_000);
         let yaml = yaml_serde::to_string(&manifest).unwrap();
         assert_eq!(
@@ -1037,6 +1052,7 @@ extensions:
         spec.profile.events.push(FaultEvent {
             at_ms: 8000,
             fault: FaultSpec::default(),
+            faults: Default::default(),
         });
         let Err(error) = BuilderApp::from_spec(spec, Discovery::default()) else {
             panic!("unsupported timeline was accepted");

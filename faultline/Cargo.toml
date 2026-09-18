@@ -19,5 +19,6 @@ faultline-runtime = { path = "../faultline-runtime" }
 clap = { workspace = true, features = ["derive"] }
 crossterm.workspace = true
 ratatui.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, default-features = true }
 yaml_serde.workspace = true

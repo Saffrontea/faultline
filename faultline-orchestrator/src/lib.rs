@@ -12,7 +12,7 @@ pub mod timeline;
 pub mod traffic;
 pub mod workload;
 
-pub use experiment::{PreparedExperiment, Tooling, prepare_experiment};
+pub use experiment::{PreparedExperiment, Tooling, capture_environment, prepare_experiment};
 pub use session::{Direction, Session, SessionOptions};
 pub use traffic::{TrafficGuard, TrafficStatus};
 pub use workload::{Discovery, WorkloadGuard};

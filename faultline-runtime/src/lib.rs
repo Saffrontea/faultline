@@ -8,7 +8,7 @@ use std::{
     net::{IpAddr, ToSocketAddrs},
 };
 
-use faultline_common::{LOSS_ALGORITHM_HASH, PROTOCOL_TCP, PROTOCOL_UDP};
+use faultline_common::{LOSS_ALGORITHM_HASH, MAX_RULES, PROTOCOL_TCP, PROTOCOL_UDP};
 use faultline_protocol::{RuleSpec, TIMELINE_VERSION, Timeline, TimelineEvent, TimelineKind};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,12 @@ pub struct ExperimentSpec {
     pub version: u32,
     pub name: String,
     pub source: WorkloadSpec,
-    pub destination: DestinationSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<DestinationSpec>,
+    /// Named L3/L4 selectors. This is the full form used when an experiment
+    /// needs more than one communication relation or a source CIDR.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selectors: Vec<CommunicationSelector>,
     pub profile: FaultProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic: Option<TrafficSpec>,
@@ -154,6 +159,17 @@ pub struct DestinationSpec {
     pub resolution: ResolutionStrategy,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommunicationSelector {
+    pub name: String,
+    /// Optional source address/CIDR/hostname. An omitted source is a catch-all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(flatten)]
+    pub destination: DestinationSpec,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolutionStrategy {
@@ -183,6 +199,9 @@ pub struct FaultEvent {
     pub at_ms: u64,
     #[serde(flatten)]
     pub fault: FaultSpec,
+    /// Complete named fault state for experiments using `selectors`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub faults: BTreeMap<String, FaultSpec>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -197,18 +216,96 @@ pub struct FaultSpec {
     pub seed: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ResolvedExperiment {
     pub version: u32,
     pub name: String,
     pub attach: AttachSpec,
-    pub destination: ResolvedDestination,
+    /// Kept for readers of version-1 single-selector artifacts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<ResolvedDestination>,
+    pub selectors: Vec<ResolvedSelector>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selection_notes: Vec<String>,
     pub timeline: Timeline,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<ExecutionEnvironment>,
+    /// Snapshot after the agent has attached and installed any required qdisc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_environment: Option<ExecutionEnvironment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExperimentExecution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traffic: Option<TrafficSpec>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ExperimentExecution {
+    pub started_at_unix_ms: u64,
+    pub completed_at_unix_ms: u64,
+    pub applied_events: Vec<AppliedEventRecord>,
+    /// Time-series samples pair the accepted configuration with the resulting
+    /// dataplane counters. `delayed` means an EDT was scheduled; it is not an
+    /// end-to-end latency measurement.
+    pub rule_observations: Vec<RuleObservation>,
+    pub selection_diagnostics: Vec<SelectionDiagnosticObservation>,
+    /// Last cumulative dataplane report for each concrete rule. A rule with no
+    /// entry was accepted but never observed in a stats report.
+    pub final_rule_stats: BTreeMap<u32, Value>,
+    /// Global selection misses are kept separate because no rule has been
+    /// selected at that point in the dataplane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_diagnostics: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RuleObservation {
+    pub observed_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_event_index: Option<usize>,
+    /// True for the first report after a ruleset swap. Its interval delta may
+    /// include packets from the preceding generation.
+    pub interval_may_span_rule_change: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configured_rule: Option<RuleSpec>,
+    pub stats: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SelectionDiagnosticObservation {
+    pub observed_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_event_index: Option<usize>,
+    pub diagnostics: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AppliedEventRecord {
+    pub event_index: usize,
+    pub scheduled_at_ms: u64,
+    pub requested_at_ms: u64,
+    pub applied_at_ms: u64,
+    pub rule_ids: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ExecutionEnvironment {
+    pub captured_at_unix_ms: u64,
+    pub target: String,
+    pub interface: String,
+    pub faultline_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_release: Option<String>,
+    pub offloads: BTreeMap<String, bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qdiscs: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "runtime", rename_all = "snake_case")]
 pub enum AttachSpec {
     Local {
@@ -260,13 +357,39 @@ impl AttachSpec {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ResolvedDestination {
     pub selector: String,
     pub networks: Vec<IpNet>,
     pub protocol: NetworkProtocol,
     pub port: Option<u16>,
     pub resolution: ResolutionStrategy,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResolvedSelector {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_selector: Option<String>,
+    pub source_networks: Vec<IpNet>,
+    pub destination: ResolvedDestination,
+    /// Concrete rule bindings let a stats `rule_id` be traced back to the
+    /// authored communication selector.
+    pub rules: Vec<ResolvedRuleBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResolvedRuleBinding {
+    pub rule_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<IpNet>,
+    pub destination: IpNet,
+    pub protocol: NetworkProtocol,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Dataplane selection is destination LPM first, then source LPM. Protocol
+    /// and port are filters on the selected source rule, not tie-breakers.
+    pub precedence: String,
 }
 
 pub trait DestinationResolver {
@@ -284,6 +407,64 @@ impl DestinationResolver for SystemResolver {
     }
 }
 
+impl ResolvedExperiment {
+    /// Validate a frozen plan before replaying it without authoring-time DNS
+    /// resolution or workload provisioning.
+    pub fn validate_for_rerun(&self) -> Result<(), String> {
+        if self.version != EXPERIMENT_VERSION {
+            return Err(format!("unsupported experiment version {}", self.version));
+        }
+        self.attach.validate_concrete()?;
+        self.timeline.validate()?;
+        if self.timeline.target.as_deref() != Some(self.attach.target_uri().as_str()) {
+            return Err("resolved timeline target does not match its attach point".to_owned());
+        }
+        if self.selectors.is_empty() {
+            return Err("resolved experiment has no selectors".to_owned());
+        }
+        let bindings = self
+            .selectors
+            .iter()
+            .flat_map(|selector| selector.rules.iter())
+            .map(|binding| (binding.rule_id, binding))
+            .collect::<BTreeMap<_, _>>();
+        let binding_count = self
+            .selectors
+            .iter()
+            .map(|selector| selector.rules.len())
+            .sum::<usize>();
+        if bindings.len() != binding_count {
+            return Err("resolved selector bindings repeat a rule id".to_owned());
+        }
+        for (event_index, event) in self.timeline.events.iter().enumerate() {
+            if event.rules.len() != bindings.len() {
+                return Err(format!(
+                    "resolved event {event_index} does not contain the complete selector ruleset"
+                ));
+            }
+            for rule in &event.rules {
+                let binding = bindings.get(&rule.id).ok_or_else(|| {
+                    format!(
+                        "resolved event {event_index} has unknown rule id {}",
+                        rule.id
+                    )
+                })?;
+                if rule.source != binding.source
+                    || rule.destination != binding.destination
+                    || rule.protocol != binding.protocol.number()
+                    || rule.destination_port != binding.port.unwrap_or(0)
+                {
+                    return Err(format!(
+                        "resolved event {event_index} rule {} does not match its selector binding",
+                        rule.id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ExperimentSpec {
     pub fn compile(
         &self,
@@ -293,50 +474,33 @@ impl ExperimentSpec {
         self.validate()?;
         attach.validate_concrete()?;
         self.source.validate_attach(&attach)?;
-        let networks = resolve_selector(&self.destination.selector, resolver)?;
-        let protocol = self.destination.protocol.number();
-        let destination_port = self.destination.port.unwrap_or(0);
-        let events = self
-            .profile
-            .events
-            .iter()
-            .map(|event| {
-                let rules = networks
-                    .iter()
-                    .enumerate()
-                    .map(|(id, destination)| {
-                        event
-                            .fault
-                            .rule_for(id as u32, *destination, protocol, destination_port)
-                    })
-                    .collect();
-                TimelineEvent {
-                    at_ms: event.at_ms,
-                    rules,
-                }
-            })
-            .collect();
+        let authored_selectors = self.authored_selectors();
+        let selectors = compile_selectors(&authored_selectors, resolver)?;
+        let selection_notes = validate_resolved_bindings(&selectors)?;
         let timeline = Timeline {
             version: TIMELINE_VERSION,
             kind: TimelineKind::Profile,
             name: Some(self.name.clone()),
             target: Some(attach.target_uri()),
             duration_ms: self.profile.duration_ms,
-            events,
+            events: compile_events(&self.profile.events, &selectors),
         };
         timeline.validate()?;
         Ok(ResolvedExperiment {
             version: self.version,
             name: self.name.clone(),
             attach,
-            destination: ResolvedDestination {
-                selector: self.destination.selector.clone(),
-                networks,
-                protocol: self.destination.protocol,
-                port: self.destination.port,
-                resolution: self.destination.resolution,
-            },
+            destination: self
+                .destination
+                .as_ref()
+                .map(|_| selectors[0].destination.clone()),
+            selectors,
+            selection_notes,
             timeline,
+            environment: None,
+            effective_environment: None,
+            execution: None,
+            execution_error: None,
             traffic: self.traffic.clone(),
         })
     }
@@ -347,10 +511,285 @@ impl ExperimentSpec {
         }
         validate_non_empty(&self.name, "experiment name must not be empty")?;
         self.source.validate()?;
-        self.destination.validate()?;
-        self.profile.validate()?;
+        if self.destination.is_some() && !self.selectors.is_empty() {
+            return Err("use either destination or selectors, not both".to_owned());
+        }
+        let selectors = self.authored_selectors();
+        if selectors.is_empty() {
+            return Err("experiment requires destination or selectors".to_owned());
+        }
+        selectors.iter().try_for_each(|selector| {
+            validate_non_empty(&selector.name, "selector name must not be empty")?;
+            selector.destination.validate()?;
+            (!selector.source.as_deref().is_some_and(str::is_empty))
+                .then_some(())
+                .ok_or_else(|| format!("selector {} has an empty source", selector.name))
+        })?;
+        let names = selectors
+            .iter()
+            .map(|selector| selector.name.as_str())
+            .collect::<BTreeSet<_>>();
+        if names.len() != selectors.len() {
+            return Err("selector names must be unique".to_owned());
+        }
+        self.profile.validate(&names, !self.selectors.is_empty())?;
         validate_optional(self.traffic.as_ref(), TrafficSpec::validate)
     }
+
+    fn authored_selectors(&self) -> Vec<CommunicationSelector> {
+        if !self.selectors.is_empty() {
+            return self.selectors.clone();
+        }
+        self.destination
+            .clone()
+            .map(|destination| CommunicationSelector {
+                name: "default".to_owned(),
+                source: None,
+                destination,
+            })
+            .into_iter()
+            .collect()
+    }
+}
+
+struct ResolvedSelectorInput {
+    authored: CommunicationSelector,
+    source_networks: Vec<IpNet>,
+    destination_networks: Vec<IpNet>,
+    bindings: Vec<(Option<IpNet>, IpNet)>,
+}
+
+fn compile_selectors(
+    authored: &[CommunicationSelector],
+    resolver: &impl DestinationResolver,
+) -> Result<Vec<ResolvedSelector>, String> {
+    authored
+        .iter()
+        .map(|selector| resolve_selector_input(selector, resolver))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .scan(0u32, |next_rule_id, input| {
+            let first_rule_id = *next_rule_id;
+            let count = u32::try_from(input.bindings.len())
+                .map_err(|_| "experiment produces too many rules".to_owned());
+            let result = count.and_then(|count| {
+                *next_rule_id = next_rule_id
+                    .checked_add(count)
+                    .ok_or_else(|| "experiment produces too many rules".to_owned())?;
+                Ok(input.into_resolved(first_rule_id))
+            });
+            Some(result)
+        })
+        .collect()
+}
+
+fn resolve_selector_input(
+    selector: &CommunicationSelector,
+    resolver: &impl DestinationResolver,
+) -> Result<ResolvedSelectorInput, String> {
+    let destination_networks = resolve_selector(&selector.destination.selector, resolver)?;
+    let source_networks = selector
+        .source
+        .as_deref()
+        .map(|source| resolve_selector(source, resolver))
+        .transpose()?
+        .unwrap_or_default();
+    let bindings = destination_networks
+        .iter()
+        .flat_map(|destination| {
+            compatible_sources(selector, &source_networks, *destination)
+                .into_iter()
+                .map(|source| (source, *destination))
+        })
+        .collect::<Vec<_>>();
+    if bindings.is_empty() {
+        return Err(format!(
+            "selector {} has no source and destination addresses in the same family",
+            selector.name
+        ));
+    }
+    Ok(ResolvedSelectorInput {
+        authored: selector.clone(),
+        source_networks,
+        destination_networks,
+        bindings,
+    })
+}
+
+fn compatible_sources(
+    selector: &CommunicationSelector,
+    sources: &[IpNet],
+    destination: IpNet,
+) -> Vec<Option<IpNet>> {
+    selector.source.as_ref().map_or_else(
+        || vec![None],
+        |_| {
+            sources
+                .iter()
+                .copied()
+                .filter(|source| source.addr().is_ipv4() == destination.addr().is_ipv4())
+                .map(Some)
+                .collect()
+        },
+    )
+}
+
+impl ResolvedSelectorInput {
+    fn into_resolved(self, first_rule_id: u32) -> ResolvedSelector {
+        let rules = self
+            .bindings
+            .into_iter()
+            .enumerate()
+            .map(|(offset, (source, destination))| ResolvedRuleBinding {
+                rule_id: first_rule_id + offset as u32,
+                source,
+                destination,
+                protocol: self.authored.destination.protocol,
+                port: self.authored.destination.port,
+                precedence: format!(
+                    "destination /{} then source /{}; protocol and port filter the selected rule",
+                    destination.prefix_len(),
+                    source_prefix_len(source)
+                ),
+            })
+            .collect();
+        ResolvedSelector {
+            name: self.authored.name,
+            source_selector: self.authored.source,
+            source_networks: self.source_networks,
+            destination: ResolvedDestination {
+                selector: self.authored.destination.selector,
+                networks: self.destination_networks,
+                protocol: self.authored.destination.protocol,
+                port: self.authored.destination.port,
+                resolution: self.authored.destination.resolution,
+            },
+            rules,
+        }
+    }
+}
+
+fn compile_events(events: &[FaultEvent], selectors: &[ResolvedSelector]) -> Vec<TimelineEvent> {
+    events
+        .iter()
+        .map(|event| TimelineEvent {
+            at_ms: event.at_ms,
+            rules: selectors
+                .iter()
+                .flat_map(|selector| {
+                    let fault = event.faults.get(&selector.name).unwrap_or(&event.fault);
+                    selector.rules.iter().map(move |binding| {
+                        fault.rule_for(
+                            binding.rule_id,
+                            binding.source,
+                            binding.destination,
+                            binding.protocol.number(),
+                            binding.port.unwrap_or(0),
+                        )
+                    })
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+type NamedBinding<'a> = (&'a str, &'a ResolvedRuleBinding);
+
+fn validate_resolved_bindings(selectors: &[ResolvedSelector]) -> Result<Vec<String>, String> {
+    let bindings = selectors
+        .iter()
+        .flat_map(|selector| {
+            selector
+                .rules
+                .iter()
+                .map(|rule| (selector.name.as_str(), rule))
+        })
+        .collect::<Vec<_>>();
+    if bindings.len() > MAX_RULES as usize {
+        return Err(format!(
+            "experiment produces more than {MAX_RULES} concrete rules"
+        ));
+    }
+    if let Some(((left_name, _), (right_name, _))) =
+        binding_pairs(&bindings).find(|((_, left), (_, right))| {
+            left.destination == right.destination && same_source_key(left.source, right.source)
+        })
+    {
+        return Err(format!(
+            "selectors {left_name} and {right_name} resolve to the same destination/source prefix; protocol and port do not participate in dataplane precedence"
+        ));
+    }
+    Ok(binding_pairs(&bindings)
+        .filter_map(precedence_note)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+fn binding_pairs<'a>(
+    bindings: &'a [NamedBinding<'a>],
+) -> impl Iterator<Item = (NamedBinding<'a>, NamedBinding<'a>)> + 'a {
+    bindings
+        .iter()
+        .enumerate()
+        .flat_map(|(index, right)| bindings[..index].iter().map(move |left| (*left, *right)))
+}
+
+fn precedence_note(
+    ((left_name, left), (right_name, right)): (NamedBinding<'_>, NamedBinding<'_>),
+) -> Option<String> {
+    match (
+        networks_overlap(left.destination, right.destination),
+        left.destination == right.destination,
+        sources_overlap(left.source, right.source),
+    ) {
+        (false, _, _) | (true, true, false) => None,
+        (true, false, _) => {
+            let (winner_name, winner) = [(left_name, left), (right_name, right)]
+                .into_iter()
+                .max_by_key(|(_, binding)| binding.destination.prefix_len())?;
+            Some(format!(
+                "selector {winner_name} destination {} wins inside its prefix before source selection; a protocol/port miss does not fall back to the less-specific destination",
+                winner.destination
+            ))
+        }
+        (true, true, true) => {
+            let (winner_name, winner) = [(left_name, left), (right_name, right)]
+                .into_iter()
+                .max_by_key(|(_, binding)| source_prefix_len(binding.source))?;
+            Some(format!(
+                "selector {winner_name} source {} wins for destination {}; a protocol/port miss does not fall back to the less-specific source",
+                winner
+                    .source
+                    .map_or_else(|| "catch-all".to_owned(), |source| source.to_string()),
+                winner.destination
+            ))
+        }
+    }
+}
+
+fn same_source_key(left: Option<IpNet>, right: Option<IpNet>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left == right,
+        (None, Some(network)) | (Some(network), None) => network.prefix_len() == 0,
+    }
+}
+
+fn networks_overlap(left: IpNet, right: IpNet) -> bool {
+    left.addr().is_ipv4() == right.addr().is_ipv4()
+        && (left.contains(&right.addr()) || right.contains(&left.addr()))
+}
+
+fn sources_overlap(left: Option<IpNet>, right: Option<IpNet>) -> bool {
+    match (left, right) {
+        (None, _) | (_, None) => true,
+        (Some(left), Some(right)) => networks_overlap(left, right),
+    }
+}
+
+fn source_prefix_len(source: Option<IpNet>) -> u8 {
+    source.map_or(0, |network| network.prefix_len())
 }
 
 impl DestinationSpec {
@@ -377,7 +816,7 @@ impl NetworkProtocol {
 }
 
 impl FaultProfile {
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, selector_names: &BTreeSet<&str>, named: bool) -> Result<(), String> {
         if self.events.first().is_none_or(|event| event.at_ms != 0) {
             return Err("profile must contain an event at 0ms".to_owned());
         }
@@ -386,7 +825,7 @@ impl FaultProfile {
             .iter()
             .enumerate()
             .try_fold(0, |previous, (index, event)| {
-                event.validate_after(index, previous, self.duration_ms)
+                event.validate_after(index, previous, self.duration_ms, selector_names, named)
             })?;
         Ok(())
     }
@@ -398,6 +837,8 @@ impl FaultEvent {
         index: usize,
         previous_at_ms: u64,
         duration_ms: u64,
+        selector_names: &BTreeSet<&str>,
+        named: bool,
     ) -> Result<u64, String> {
         if self.at_ms < previous_at_ms {
             return Err(format!("profile event {index} is out of order"));
@@ -406,6 +847,25 @@ impl FaultEvent {
             return Err(format!("profile event {index} exceeds duration"));
         }
         self.fault.validate(index)?;
+        if named {
+            let event_names = self
+                .faults
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            if &event_names != selector_names {
+                return Err(format!(
+                    "profile event {index} faults must name every selector exactly once"
+                ));
+            }
+        } else if !self.faults.is_empty() {
+            return Err(format!(
+                "profile event {index} uses faults without selectors"
+            ));
+        }
+        self.faults
+            .values()
+            .try_for_each(|fault| fault.validate(index))?;
         Ok(self.at_ms)
     }
 }
@@ -430,13 +890,14 @@ impl FaultSpec {
     fn rule_for(
         &self,
         id: u32,
+        source: Option<IpNet>,
         destination: IpNet,
         protocol: u8,
         destination_port: u16,
     ) -> RuleSpec {
         RuleSpec {
             id,
-            source: None,
+            source,
             destination,
             protocol,
             loss_algorithm: LOSS_ALGORITHM_HASH,
@@ -736,7 +1197,7 @@ extensions:
         let spec: ExperimentSpec = yaml_serde::from_str(MANIFEST).unwrap();
         let plan = compile(&spec);
         assert_eq!(
-            plan.destination.networks,
+            plan.destination.unwrap().networks,
             vec![
                 "192.0.2.4/32".parse().unwrap(),
                 "2001:db8::4/128".parse().unwrap()
@@ -753,14 +1214,30 @@ extensions:
     }
 
     #[test]
+    fn resolved_artifact_round_trips_and_rejects_selector_drift() {
+        let spec: ExperimentSpec = yaml_serde::from_str(MANIFEST).unwrap();
+        let plan = compile(&spec);
+        let encoded = serde_json::to_vec(&plan).unwrap();
+        let mut decoded: ResolvedExperiment = serde_json::from_slice(&encoded).unwrap();
+        decoded.validate_for_rerun().unwrap();
+        decoded.timeline.events[0].rules[0].destination = "198.51.100.1/32".parse().unwrap();
+        assert!(
+            decoded
+                .validate_for_rerun()
+                .unwrap_err()
+                .contains("does not match its selector binding")
+        );
+    }
+
+    #[test]
     fn cidr_does_not_invoke_dns_and_port_requires_transport() {
         let mut spec: ExperimentSpec = yaml_serde::from_str(MANIFEST).unwrap();
-        spec.destination.selector = "10.0.0.0/8".to_owned();
-        spec.destination.protocol = NetworkProtocol::Any;
+        spec.destination.as_mut().unwrap().selector = "10.0.0.0/8".to_owned();
+        spec.destination.as_mut().unwrap().protocol = NetworkProtocol::Any;
         assert!(spec.validate().unwrap_err().contains("requires tcp or udp"));
-        spec.destination.port = None;
+        spec.destination.as_mut().unwrap().port = None;
         assert_eq!(
-            compile(&spec).destination.networks,
+            compile(&spec).destination.unwrap().networks,
             vec!["10.0.0.0/8".parse().unwrap()]
         );
     }
@@ -820,5 +1297,128 @@ extensions:
             interval_ms: 1_000,
         });
         assert!(spec.validate().unwrap_err().contains("program"));
+    }
+
+    #[test]
+    fn named_selectors_compile_source_and_destination_relations_to_stable_rule_ids() {
+        let spec: ExperimentSpec = yaml_serde::from_str(
+            r#"
+version: 1
+name: isolate one relation
+source:
+  runtime: local
+  interface: eth0
+selectors:
+  - name: a_to_b
+    source: 10.0.0.10/32
+    selector: 10.0.1.20/32
+    protocol: tcp
+    port: 443
+  - name: a_to_c
+    source: 10.0.0.10/32
+    selector: 10.0.2.30/32
+    protocol: tcp
+    port: 443
+profile:
+  duration_ms: 1000
+  events:
+    - at_ms: 0
+      faults:
+        a_to_b: {}
+        a_to_c: {}
+    - at_ms: 250
+      faults:
+        a_to_b:
+          drop_permyriad: 10000
+          seed: 7
+        a_to_c: {}
+"#,
+        )
+        .unwrap();
+        let plan = spec
+            .compile(
+                &Resolver,
+                spec.source.resolved_attach("eth0".into()).unwrap(),
+            )
+            .unwrap();
+        assert!(plan.destination.is_none());
+        assert_eq!(plan.selectors.len(), 2);
+        assert_eq!(plan.selectors[0].rules[0].rule_id, 0);
+        assert_eq!(plan.selectors[1].rules[0].rule_id, 1);
+        assert_eq!(plan.timeline.events[1].rules[0].drop_permyriad, 10_000);
+        assert_eq!(plan.timeline.events[1].rules[1].drop_permyriad, 0);
+        assert_eq!(
+            plan.timeline.events[1].rules[0].source,
+            Some("10.0.0.10/32".parse().unwrap())
+        );
+        assert!(
+            plan.selectors[0].rules[0]
+                .precedence
+                .contains("destination /32")
+        );
+    }
+
+    #[test]
+    fn selectors_that_collapse_to_the_same_dataplane_key_are_rejected() {
+        let mut spec: ExperimentSpec = yaml_serde::from_str(MANIFEST).unwrap();
+        let destination = spec.destination.take().unwrap();
+        spec.selectors = vec![
+            CommunicationSelector {
+                name: "https".into(),
+                source: None,
+                destination: destination.clone(),
+            },
+            CommunicationSelector {
+                name: "dns".into(),
+                // Explicit /0 and an omitted source compile to the same LPM
+                // key and must not be treated as distinct selectors.
+                source: Some("0.0.0.0/0".into()),
+                destination: DestinationSpec {
+                    protocol: NetworkProtocol::Udp,
+                    port: Some(53),
+                    ..destination
+                },
+            },
+        ];
+        for event in &mut spec.profile.events {
+            event.faults.insert("https".into(), event.fault.clone());
+            event.faults.insert("dns".into(), FaultSpec::default());
+        }
+        let error = spec
+            .compile(
+                &Resolver,
+                spec.source.resolved_attach("eth0".into()).unwrap(),
+            )
+            .unwrap_err();
+        assert!(error.contains("protocol and port do not participate"));
+    }
+
+    #[test]
+    fn overlapping_prefix_precedence_is_explained_in_the_resolved_plan() {
+        let spec: ExperimentSpec = yaml_serde::from_str(
+            r#"
+version: 1
+name: source precedence
+source: { runtime: local, interface: eth0 }
+selectors:
+  - { name: catch_all, selector: 192.0.2.0/24 }
+  - { name: client_a, source: 10.0.0.7/32, selector: 192.0.2.0/24, protocol: tcp, port: 443 }
+profile:
+  duration_ms: 1
+  events:
+    - at_ms: 0
+      faults: { catch_all: {}, client_a: { drop_permyriad: 10000 } }
+"#,
+        )
+        .unwrap();
+        let plan = spec
+            .compile(
+                &Resolver,
+                spec.source.resolved_attach("eth0".into()).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(plan.selection_notes.len(), 1);
+        assert!(plan.selection_notes[0].contains("client_a source 10.0.0.7/32 wins"));
+        assert!(plan.selection_notes[0].contains("does not fall back"));
     }
 }

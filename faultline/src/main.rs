@@ -1,11 +1,10 @@
 mod app;
 mod builder;
+mod comparison;
 mod timeline;
-#[cfg(test)]
-use std::io::Read;
 use std::{
     fs,
-    io::{BufRead as _, BufReader, Write, stdout},
+    io::{BufRead as _, BufReader, Read, Write, stdout},
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
@@ -31,11 +30,13 @@ use faultline_orchestrator::timeline::rules_impair;
 use faultline_orchestrator::timeline::{
     load as load_timeline, play as play_timeline, set_loss_once,
 };
-use faultline_orchestrator::{Session, SessionOptions, Tooling, prepare_experiment};
-use faultline_protocol::{Request, TimelineKind, encode_line};
+use faultline_orchestrator::{
+    Session, SessionOptions, Tooling, WorkloadGuard, capture_environment, prepare_experiment,
+};
+use faultline_protocol::{Request, Timeline, TimelineKind, encode_line};
 #[cfg(test)]
-use faultline_protocol::{RuleSpec, TIMELINE_VERSION, Timeline, TimelineEvent};
-use faultline_runtime::{ExperimentSpec, SystemResolver};
+use faultline_protocol::{RuleSpec, TIMELINE_VERSION, TimelineEvent};
+use faultline_runtime::{ExperimentSpec, ResolvedExperiment, SystemResolver};
 #[cfg(test)]
 use ratatui::style::Color;
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -53,10 +54,19 @@ struct Options {
     #[arg(long)]
     list_targets: bool,
 
+    /// Compare two completed resolved artifacts and print a JSON report.
+    #[arg(long, num_args = 2, value_names = ["BASE", "CANDIDATE"], conflicts_with_all = ["target", "experiment", "rerun_resolved", "new_experiment", "edit_experiment", "profile", "replay", "record", "set_loss", "resolved_output"])]
+    compare_resolved: Option<Vec<PathBuf>>,
+
     /// Execute a TUI-authored experiment manifest. The source is resolved to
     /// an agent target and the destination is snapshotted to L3 rules.
     #[arg(long, conflicts_with_all = ["target", "profile", "replay", "record", "set_loss"])]
     experiment: Option<PathBuf>,
+
+    /// Re-run a frozen resolved artifact without resolving selectors again.
+    /// The concrete target must already exist.
+    #[arg(long, conflicts_with_all = ["target", "experiment", "new_experiment", "edit_experiment", "profile", "replay", "record", "set_loss"])]
+    rerun_resolved: Option<PathBuf>,
 
     /// Open the visual experiment builder. Ctrl-S saves the manifest and
     /// Ctrl-E saves it, resolves its destination, and executes it immediately.
@@ -156,6 +166,9 @@ impl Options {
 
 fn main() -> anyhow::Result<()> {
     let mut options = Options::parse();
+    if let Some(paths) = &options.compare_resolved {
+        return compare_resolved_experiments(&paths[0], &paths[1]);
+    }
     if options.list_targets {
         for target in discover_targets() {
             println!("{target}");
@@ -165,87 +178,10 @@ fn main() -> anyhow::Result<()> {
     if wants_default_builder(&options) {
         options.new_experiment = Some(PathBuf::from("experiment.yaml"));
     }
-    let experiment_path = options
-        .new_experiment
-        .as_ref()
-        .or(options.edit_experiment.as_ref())
-        .or(options.experiment.as_ref())
-        .cloned();
-    let built_experiment = if let Some(path) = &options.new_experiment {
-        match builder::run(path)? {
-            Some(plan) => Some(plan),
-            None => return Ok(()),
-        }
-    } else if let Some(path) = &options.edit_experiment {
-        let spec = load_experiment_spec(path)?;
-        match builder::edit(path, spec)? {
-            Some(plan) => Some(plan),
-            None => return Ok(()),
-        }
-    } else {
-        None
+    let Some(mut prepared) = prepare_frontend(&mut options)? else {
+        return Ok(());
     };
-    let experiment_spec = built_experiment.or(options
-        .experiment
-        .as_ref()
-        .map(load_experiment_spec)
-        .transpose()?);
-    if options.resolved_output.is_some() && experiment_spec.is_none() {
-        bail!("--resolved-output requires --experiment, --new-experiment, or --edit-experiment");
-    }
-    let prepared_experiment = experiment_spec
-        .as_ref()
-        .map(|spec| {
-            prepare_experiment(
-                spec,
-                &SystemResolver,
-                Tooling {
-                    agent: &options.agent,
-                    engine: options.engine.as_deref(),
-                },
-            )
-        })
-        .transpose()?;
-    let (experiment, _workload) = prepared_experiment
-        .map(|prepared| prepared.into_parts())
-        .map_or((None, None), |(plan, workload)| {
-            (Some(plan), Some(workload))
-        });
-    if let Some(plan) = &experiment {
-        options.target = plan.timeline.target.clone();
-        options.destination = plan
-            .destination
-            .networks
-            .first()
-            .context("resolved experiment has no destination")?
-            .to_string();
-        let resolved_path = options
-            .resolved_output
-            .clone()
-            .or_else(|| experiment_path.as_deref().map(resolved_sidecar_path));
-        if let Some(path) = &resolved_path {
-            fs::write(path, serde_json::to_vec_pretty(plan)?)
-                .with_context(|| format!("writing resolved experiment {}", path.display()))?;
-        }
-    }
-    let traffic_plan = experiment.as_ref().and_then(|plan| {
-        plan.traffic
-            .clone()
-            .map(|traffic| (plan.attach.clone(), traffic))
-    });
-    let observe_experiment = experiment.is_some();
-    let playback = experiment.map(|plan| plan.timeline).or(options
-        .profile
-        .as_ref()
-        .map(|path| (path, TimelineKind::Profile))
-        .or_else(|| {
-            options
-                .replay
-                .as_ref()
-                .map(|path| (path, TimelineKind::Replay))
-        })
-        .map(|(path, kind)| load_timeline(path, kind))
-        .transpose()?);
+    let playback = select_playback(&options, prepared.experiment.as_ref())?;
     if options.target.is_none()
         && let Some(target) = playback
             .as_ref()
@@ -254,6 +190,175 @@ fn main() -> anyhow::Result<()> {
         options.target = Some(target);
     }
     let session = Session::open(&options.session_options())?;
+    record_effective_environment(&mut prepared)?;
+    run_session(&options, session, playback, &mut prepared)
+}
+
+enum PlanInput {
+    None,
+    Authored(Box<ExperimentSpec>),
+    Resolved(Box<ResolvedExperiment>),
+}
+
+struct PreparedFrontend {
+    experiment: Option<ResolvedExperiment>,
+    _workload: Option<WorkloadGuard>,
+    resolved_path: Option<PathBuf>,
+}
+
+fn prepare_frontend(options: &mut Options) -> anyhow::Result<Option<PreparedFrontend>> {
+    let experiment_path = options
+        .new_experiment
+        .as_ref()
+        .or(options.edit_experiment.as_ref())
+        .or(options.experiment.as_ref())
+        .cloned();
+    let Some(input) = select_plan_input(options)? else {
+        return Ok(None);
+    };
+    if options.resolved_output.is_some() && matches!(input, PlanInput::None) {
+        bail!(
+            "--resolved-output requires --experiment, --new-experiment, --edit-experiment, or --rerun-resolved"
+        );
+    }
+    let (experiment, workload) = prepare_plan(input, options)?;
+    let resolved_path = options
+        .resolved_output
+        .clone()
+        .or_else(|| experiment_path.as_deref().map(resolved_sidecar_path))
+        .or_else(|| options.rerun_resolved.as_deref().map(rerun_sidecar_path));
+    if let Some(plan) = &experiment {
+        configure_session_from_plan(options, plan)?;
+        write_resolved_plan(resolved_path.as_deref(), plan, "resolved")?;
+    }
+    Ok(Some(PreparedFrontend {
+        experiment,
+        _workload: workload,
+        resolved_path,
+    }))
+}
+
+fn select_plan_input(options: &Options) -> anyhow::Result<Option<PlanInput>> {
+    if let Some(path) = &options.rerun_resolved {
+        return load_resolved_experiment(path)
+            .map(Box::new)
+            .map(PlanInput::Resolved)
+            .map(Some);
+    }
+    if let Some(path) = &options.new_experiment {
+        return builder::run(path).map(|spec| spec.map(Box::new).map(PlanInput::Authored));
+    }
+    if let Some(path) = &options.edit_experiment {
+        return builder::edit(path, load_experiment_spec(path)?)
+            .map(|spec| spec.map(Box::new).map(PlanInput::Authored));
+    }
+    options
+        .experiment
+        .as_ref()
+        .map(load_experiment_spec)
+        .transpose()
+        .map(|spec| Some(spec.map_or(PlanInput::None, |spec| PlanInput::Authored(Box::new(spec)))))
+}
+
+fn prepare_plan(
+    input: PlanInput,
+    options: &Options,
+) -> anyhow::Result<(Option<ResolvedExperiment>, Option<WorkloadGuard>)> {
+    match input {
+        PlanInput::None => Ok((None, None)),
+        PlanInput::Resolved(plan) => {
+            let plan = *plan;
+            let plan = ResolvedExperiment {
+                environment: Some(capture_environment(&plan.attach)),
+                effective_environment: None,
+                execution: None,
+                execution_error: None,
+                ..plan
+            };
+            Ok((Some(plan), None))
+        }
+        PlanInput::Authored(spec) => prepare_experiment(
+            &spec,
+            &SystemResolver,
+            Tooling {
+                agent: &options.agent,
+                engine: options.engine.as_deref(),
+            },
+        )
+        .map(|prepared| {
+            let (plan, workload) = prepared.into_parts();
+            (Some(plan), Some(workload))
+        }),
+    }
+}
+
+fn configure_session_from_plan(
+    options: &mut Options,
+    plan: &ResolvedExperiment,
+) -> anyhow::Result<()> {
+    options.target = plan.timeline.target.clone();
+    options.destination = plan
+        .selectors
+        .first()
+        .context("resolved experiment has no selectors")?
+        .destination
+        .networks
+        .first()
+        .context("resolved experiment has no destination")?
+        .to_string();
+    Ok(())
+}
+
+fn select_playback(
+    options: &Options,
+    experiment: Option<&ResolvedExperiment>,
+) -> anyhow::Result<Option<Timeline>> {
+    experiment
+        .map(|plan| Ok(plan.timeline.clone()))
+        .or_else(|| {
+            options
+                .profile
+                .as_ref()
+                .map(|path| load_timeline(path, TimelineKind::Profile))
+        })
+        .or_else(|| {
+            options
+                .replay
+                .as_ref()
+                .map(|path| load_timeline(path, TimelineKind::Replay))
+        })
+        .transpose()
+}
+
+fn record_effective_environment(prepared: &mut PreparedFrontend) -> anyhow::Result<()> {
+    if let Some(plan) = &mut prepared.experiment {
+        plan.effective_environment = Some(capture_environment(&plan.attach));
+        write_resolved_plan(prepared.resolved_path.as_deref(), plan, "attached")?;
+    }
+    Ok(())
+}
+
+fn write_resolved_plan(
+    path: Option<&Path>,
+    plan: &ResolvedExperiment,
+    phase: &str,
+) -> anyhow::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    fs::write(path, serde_json::to_vec_pretty(plan)?)
+        .with_context(|| format!("writing {phase} experiment {}", path.display()))
+}
+
+fn run_session(
+    options: &Options,
+    session: Session,
+    playback: Option<Timeline>,
+    prepared: &mut PreparedFrontend,
+) -> anyhow::Result<()> {
+    if let Some(timeline) = playback {
+        return run_playback_session(options, timeline, session, prepared);
+    }
     let Session {
         reader,
         mut writer,
@@ -262,33 +367,6 @@ fn main() -> anyhow::Result<()> {
         record_target,
         owned,
     } = session;
-    if let Some(timeline) = playback {
-        if observe_experiment {
-            let result = run_observed_timeline(
-                &timeline,
-                reader,
-                &mut *writer,
-                &label,
-                traffic_plan.as_ref(),
-                options.snapshot_after_ms,
-            );
-            if owned {
-                let _ = writer.write_all(&encode_line(&Request::Stop { id: u64::MAX })?);
-                let _ = writer.flush();
-            }
-            drop(writer);
-            finish_child(&mut child);
-            return result;
-        }
-        let result = play_timeline(&timeline, reader, &mut *writer);
-        if owned {
-            let _ = writer.write_all(&encode_line(&Request::Stop { id: u64::MAX })?);
-            let _ = writer.flush();
-        }
-        drop(writer);
-        finish_child(&mut child);
-        return result;
-    }
     if let Some(loss) = options.set_loss {
         let result = set_loss_once(reader, &mut *writer, loss);
         if result.is_ok() && options.hold_seconds != 0 {
@@ -298,6 +376,76 @@ fn main() -> anyhow::Result<()> {
         finish_child(&mut child);
         return result;
     }
+    run_interactive_session(options, reader, writer, child, label, record_target, owned)
+}
+
+fn run_playback_session(
+    options: &Options,
+    timeline: Timeline,
+    session: Session,
+    prepared: &mut PreparedFrontend,
+) -> anyhow::Result<()> {
+    let Session {
+        reader,
+        mut writer,
+        mut child,
+        label,
+        owned,
+        ..
+    } = session;
+    let Some(plan) = &mut prepared.experiment else {
+        let result = play_timeline(&timeline, reader, &mut *writer);
+        stop_owned_session(owned, &mut *writer)?;
+        drop(writer);
+        finish_child(&mut child);
+        return result;
+    };
+    let traffic_plan = plan
+        .traffic
+        .clone()
+        .map(|traffic| (plan.attach.clone(), traffic));
+    let result = run_observed_timeline(
+        &timeline,
+        reader,
+        &mut *writer,
+        &label,
+        traffic_plan.as_ref(),
+        options.snapshot_after_ms,
+    );
+    stop_owned_session(owned, &mut *writer)?;
+    drop(writer);
+    finish_child(&mut child);
+    match result {
+        Ok(execution) => {
+            plan.execution = Some(execution);
+            plan.execution_error = None;
+            write_resolved_plan(prepared.resolved_path.as_deref(), plan, "completed")
+        }
+        Err(error) => {
+            plan.execution_error = Some(format!("{error:#}"));
+            write_resolved_plan(prepared.resolved_path.as_deref(), plan, "failed")?;
+            Err(error)
+        }
+    }
+}
+
+fn stop_owned_session(owned: bool, writer: &mut dyn Write) -> anyhow::Result<()> {
+    if owned {
+        writer.write_all(&encode_line(&Request::Stop { id: u64::MAX })?)?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+fn run_interactive_session(
+    options: &Options,
+    reader: Box<dyn Read + Send>,
+    mut writer: Box<dyn Write + Send>,
+    mut child: Option<std::process::Child>,
+    label: String,
+    record_target: String,
+    owned: bool,
+) -> anyhow::Result<()> {
     let (messages, incoming) = mpsc::channel();
     thread::spawn(move || {
         for line in BufReader::new(reader).lines() {
@@ -394,6 +542,7 @@ fn wants_default_builder(options: &Options) -> bool {
     let has_socket = false;
     options.target.is_none()
         && options.experiment.is_none()
+        && options.rerun_resolved.is_none()
         && options.new_experiment.is_none()
         && options.edit_experiment.is_none()
         && options.profile.is_none()
@@ -407,6 +556,29 @@ fn wants_default_builder(options: &Options) -> bool {
 
 fn resolved_sidecar_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.resolved.json", path.display()))
+}
+
+fn rerun_sidecar_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.rerun.json", path.display()))
+}
+
+fn load_resolved_experiment(
+    path: &PathBuf,
+) -> anyhow::Result<faultline_runtime::ResolvedExperiment> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("reading resolved experiment {}", path.display()))?;
+    let plan: faultline_runtime::ResolvedExperiment = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decoding resolved experiment {}", path.display()))?;
+    plan.validate_for_rerun().map_err(anyhow::Error::msg)?;
+    Ok(plan)
+}
+
+fn compare_resolved_experiments(base: &PathBuf, candidate: &PathBuf) -> anyhow::Result<()> {
+    let base_plan = load_resolved_experiment(base)?;
+    let candidate_plan = load_resolved_experiment(candidate)?;
+    let report = comparison::compare(&base_plan, &candidate_plan);
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 fn load_experiment_spec(path: &PathBuf) -> anyhow::Result<ExperimentSpec> {
@@ -578,6 +750,50 @@ mod tests {
         assert!(
             Options::try_parse_from([FLT_APPLICATION, "--resolved-output", "effective.json",])
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn frozen_resolved_plan_has_an_explicit_rerun_path() {
+        let options = Options::try_parse_from([
+            FLT_APPLICATION,
+            "--rerun-resolved",
+            "run.resolved.json",
+            "--resolved-output",
+            "run-2.resolved.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            options.rerun_resolved,
+            Some(PathBuf::from("run.resolved.json"))
+        );
+        assert_eq!(
+            options.resolved_output,
+            Some(PathBuf::from("run-2.resolved.json"))
+        );
+        assert!(
+            Options::try_parse_from([
+                FLT_APPLICATION,
+                "--rerun-resolved",
+                "run.resolved.json",
+                "--experiment",
+                "experiment.yaml",
+            ])
+            .is_err()
+        );
+        let compare = Options::try_parse_from([
+            FLT_APPLICATION,
+            "--compare-resolved",
+            "base.json",
+            "candidate.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            compare.compare_resolved,
+            Some(vec![
+                PathBuf::from("base.json"),
+                PathBuf::from("candidate.json")
+            ])
         );
     }
 

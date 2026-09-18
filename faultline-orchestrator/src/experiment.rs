@@ -1,8 +1,12 @@
 //! End-to-end preparation of an authored experiment into a concrete plan.
 
+use std::{collections::BTreeMap, process::Command, time::SystemTime};
+
 #[cfg(test)]
 use faultline_common::FAULTLINE_AGENT_APPLICATION;
-use faultline_runtime::{DestinationResolver, ExperimentSpec, ResolvedExperiment};
+use faultline_runtime::{
+    AttachSpec, DestinationResolver, ExecutionEnvironment, ExperimentSpec, ResolvedExperiment,
+};
 
 use crate::workload::{self, WorkloadGuard};
 
@@ -38,7 +42,96 @@ pub fn prepare_experiment(
     let workload = workload::prepare(&spec.source, tooling.agent, tooling.engine)?;
     let attach = workload::resolve_attach(&spec.source)?;
     let plan = spec.compile(resolver, attach).map_err(anyhow::Error::msg)?;
+    let plan = ResolvedExperiment {
+        environment: Some(capture_environment(&plan.attach)),
+        ..plan
+    };
     Ok(PreparedExperiment { plan, workload })
+}
+
+pub fn capture_environment(attach: &AttachSpec) -> ExecutionEnvironment {
+    let interface = match attach {
+        AttachSpec::Local { interface, .. }
+        | AttachSpec::Docker { interface, .. }
+        | AttachSpec::Lxc { interface, .. } => interface.clone(),
+    };
+    let kernel = capture_command(attach, "uname", &["-r"])
+        .map(|value| value.trim().to_owned())
+        .map_err(|error| format!("kernel: {error}"));
+    let offloads = capture_command(attach, "ethtool", &["-k", &interface])
+        .map(|output| parse_offloads(&output))
+        .map_err(|error| format!("offloads: {error}"));
+    let qdiscs = capture_command(attach, "tc", &["-j", "qdisc", "show", "dev", &interface])
+        .and_then(|output| {
+            serde_json::from_str(&output).map_err(|error| format!("invalid tc JSON: {error}"))
+        })
+        .map_err(|error| format!("qdiscs: {error}"));
+    let diagnostics = [
+        kernel.as_ref().err(),
+        offloads.as_ref().err(),
+        qdiscs.as_ref().err(),
+    ]
+    .into_iter()
+    .flatten()
+    .cloned()
+    .collect();
+    ExecutionEnvironment {
+        captured_at_unix_ms: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64,
+        target: attach.target_uri(),
+        interface,
+        faultline_version: env!("CARGO_PKG_VERSION").to_owned(),
+        kernel_release: kernel.ok(),
+        offloads: offloads.unwrap_or_default(),
+        qdiscs: qdiscs.ok(),
+        diagnostics,
+    }
+}
+
+fn capture_command(attach: &AttachSpec, program: &str, args: &[&str]) -> Result<String, String> {
+    let mut command = match attach {
+        AttachSpec::Local { .. } => Command::new(program),
+        AttachSpec::Docker { container, .. } => {
+            let mut command = Command::new("docker");
+            command.args(["exec", container, program]);
+            command
+        }
+        AttachSpec::Lxc { container, .. } => {
+            let mut command = Command::new("lxc-attach");
+            command.args(["-n", container, "--", program]);
+            command
+        }
+    };
+    let output = command
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not run {program}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{program} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("{program} returned non-UTF-8: {error}"))
+}
+
+fn parse_offloads(output: &str) -> BTreeMap<String, bool> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (name, state) = line.trim().split_once(':')?;
+            match state.split_whitespace().next()? {
+                "on" => Some((name.to_owned(), true)),
+                "off" => Some((name.to_owned(), false)),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -69,17 +162,19 @@ mod tests {
                 interface: "lo".into(),
                 process: None,
             },
-            destination: DestinationSpec {
+            destination: Some(DestinationSpec {
                 selector: "example.test".into(),
                 protocol: NetworkProtocol::Tcp,
                 port: Some(443),
                 resolution: ResolutionStrategy::Snapshot,
-            },
+            }),
+            selectors: Vec::new(),
             profile: FaultProfile {
                 duration_ms: 1,
                 events: vec![FaultEvent {
                     at_ms: 0,
                     fault: FaultSpec::default(),
+                    faults: BTreeMap::new(),
                 }],
             },
             traffic: None,
@@ -99,5 +194,17 @@ mod tests {
             prepared.plan().timeline.target.as_deref(),
             Some("local://lo")
         );
+        let environment = prepared.plan().environment.as_ref().unwrap();
+        assert_eq!(environment.target, "local://lo");
+        assert_eq!(environment.interface, "lo");
+    }
+
+    #[test]
+    fn ethtool_features_are_recorded_as_boolean_conditions() {
+        let parsed = parse_offloads(
+            "Features for eth0:\ntcp-segmentation-offload: on\ngeneric-receive-offload: off [fixed]\n",
+        );
+        assert!(parsed["tcp-segmentation-offload"]);
+        assert!(!parsed["generic-receive-offload"]);
     }
 }

@@ -1,0 +1,36 @@
+version: 1
+name: isolate A to B while preserving A to C
+
+source:
+  runtime: local
+  interface: eth0
+
+selectors:
+  - name: a_to_b
+    source: 10.0.0.10/32
+    selector: 10.0.1.20/32
+    protocol: tcp
+    port: 443
+  - name: a_to_c
+    source: 10.0.0.10/32
+    selector: 10.0.2.30/32
+    protocol: tcp
+    port: 443
+
+profile:
+  duration_ms: 10000
+  events:
+    - at_ms: 0
+      faults:
+        a_to_b: {}
+        a_to_c: {}
+    - at_ms: 2000
+      faults:
+        a_to_b:
+          drop_permyriad: 10000
+          seed: 42
+        a_to_c: {}
+    - at_ms: 7000
+      faults:
+        a_to_b: {}
+        a_to_c: {}

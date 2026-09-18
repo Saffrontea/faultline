@@ -125,13 +125,13 @@ flowchart LR
 ## 実験実行境界
 
 `faultline-runtime`は、プロダクトUXと低レベルdataplane protocolの間にあるportableかつ
-非特権の境界です。`ExperimentSpec`、Local/Docker/LXCのsource workload、L3 destination、
+非特権の境界です。`ExperimentSpec`、Local/Docker/LXCのsource workload、名前付きL3/L4 selector、
 fault profile、traffic generatorを所有します。container interfaceの`auto`はauthoring用の
 `WorkloadSpec`だけが保持し、runtime adapterが具体化した`AttachSpec`を注入してから実行planへ
 compileします。
 
 - concrete attach target（runtime、container、具体的なinterface）
-- snapshot解決済みのIPv4/IPv6 network列
+- snapshot解決済みのsource/destination IPv4/IPv6 network列とselector→rule ID対応
 - protocolと任意のdestination port
 - atomicな`RuleSpec`列からなる`Timeline`
 - source内で動かす任意のtraffic定義
@@ -178,7 +178,13 @@ adapterではないため`local://INTERFACE`を必須とし、`local://auto`は�
 destinationはmanaged workloadではなく、IP address、CIDR、またはhostnameとして表現します。
 hostnameやdiscovery結果は入力支援であり、実行時にはIPv4/IPv6 host routeへ一度だけ解決します。
 final compileで得たL3解決結果をそのまま実行へ渡すため、agent実行までDNSを再解決しません。
+単一`destination`は`default` selectorへの短縮形です。複数の`selectors`ではsource CIDRも解決し、eventの
+`faults` mapからselectorごとの完全なrulesetを生成します。同じdestination/source prefixはdataplane上で
+一つのruleしか持てないため、protocol/portだけが異なる衝突もcompile時にrejectします。
+
 実際に使ったnetwork、具体化後のattach先、targetを書き換えたtimelineは`*.resolved.json`へ保存されます。
+同じartifactへattach前後のkernel/offload/qdisc、request/applied時刻、受理済みruleを伴うstats sample、
+rule選択前のdiagnosticsも記録します。これによりcontrol planeでの受理とdataplaneでの作用を区別します。
 
 ### Visual builderとmanifest
 

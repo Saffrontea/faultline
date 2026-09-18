@@ -441,10 +441,16 @@ drop判定はflow、packet sequence、rule ID、seedから決定的に計算し�
 
 ## 実験manifest
 
-基本の実験modelでは、source workloadとL3 destinationを分離します。sourceにはlocal
-interface、Docker container、LXC containerを指定できます。destinationにはIP address、
-CIDR、hostnameを指定できます。hostnameは起動時に一度だけ解決され、有効なすべての
-IPv4/IPv6 addressが解決済み実行planへ記録されます。
+基本の実験modelでは、attachするsource workloadとL3/L4通信selectorを分離します。sourceにはlocal
+interface、Docker container、LXC containerを指定できます。単一通信は従来の`destination`短縮形、
+複数通信やsource CIDRは名前付き`selectors`で表現します。各selectorのsourceとdestinationには
+IP address、CIDR、hostnameを指定でき、hostnameは起動時に一度だけIPv4/IPv6 networkへ解決されます。
+
+`profile.events[].faults`はすべてのselector名を一度ずつ指定する完全なrulesetです。例えば
+[`selective-outage.yaml`](experiments/selective-outage.yaml)は`a_to_b`だけを遮断し、同じsourceからの
+`a_to_c`をpass ruleとして観測し続けます。rule選択はdestinationのlongest-prefix、次にsourceの
+longest-prefixです。protocolとportは選ばれたsource ruleへのfilterであり、優先順位には使われません。
+そのため同じdestination/source prefixをprotocolやportだけで分けたselectorはcompile時に拒否します。
 
 ```bash
 flt --experiment experiments/api-outage.yaml \
@@ -457,6 +463,32 @@ validationとcompileは`faultline-runtime`、provisioning、interface解決、re
 これらのorchestration rule自体は保持しません。privileged agentはDocker、LXC、DNS、実験manifestを
 意識せず、具体的なinterfaceとatomicなL3 ruleだけを受け取ります。
 例は[`experiments/api-outage.yaml`](experiments/api-outage.yaml)を参照してください。
+
+resolved artifactには、解決済みnetwork、selectorとrule IDの対応、実効seed、attach前後のkernel release、
+interface offload、qdiscを保存します。実行後には各eventの送信時刻と`applied`時刻、および時系列の
+`rule_observations`と`selection_diagnostics`が追記されます。`applied_events`は設定が受理された証拠、
+rule observationはその設定に対してpacketがmatchしactionを受けた証拠です。
+ruleset切替後の最初のreportはintervalが旧generationをまたぐ可能性があるため、
+`interval_may_span_rule_change`で明示します。
+agentがruleを拒否した場合など、実験が完了しなかった理由は`execution_error`へ保存します。
+
+`delayed`はEDTを設定したskb数であり、end-to-end latencyの測定値ではありません。bandwidthは設定値と
+`wire_mbps`、`pacing_dropped`を並べて確認します。rule選択前のdestination/source/protocol/port missは
+特定ruleへ帰属させません。GSOではdecisionがskb単位なので、skb、logical segment、wire byteのcounterを
+分けて記録します。
+
+解決済みselectorとseedを固定したまま再実行する場合は、resolved artifactを直接入力します。concrete
+targetは既に存在している必要があります。既定では元fileを変更せず、結果を`.rerun.json`へ書きます。
+
+```bash
+flt --rerun-resolved /tmp/api-outage.resolved.json
+# /tmp/api-outage.resolved.json.rerun.json が比較対象になる
+flt --compare-resolved /tmp/api-outage.resolved.json \
+  /tmp/api-outage.resolved.json.rerun.json
+```
+
+比較結果はJSONで、attach・selector・timelineが同じかを`conditions_equal`で示し、kernel、offload、
+qdiscの一致状態と両実行の最終rule stats・selection diagnosticsを並べます。
 
 YAMLを書かずに新規作成できます。
 
@@ -477,7 +509,8 @@ flt --edit-experiment experiments/my-experiment.yaml
 F2で組み込みのbrief-outage、lossy-link、slow-link templateを順に切り替えます。
 visual editorは、extension、command traffic、Dockerのcommand/environment/cleanup設定、
 高度なfault fieldなど、現在のformにないfieldも保持します。visual editorで表現できない
-timelineは暗黙に単純化せず、エラーにします。
+timelineは暗黙に単純化せず、エラーにします。名前付き`selectors`はmanifestで編集し、visual editorは
+単一`destination`の実験だけを受け付けます。
 
 local sourceには、shellを介さないprocess定義（`program`、argument、environment、working
 directory）も指定できます。builderではprogramを直接設定でき、詳細なargumentはmanifest編集で
