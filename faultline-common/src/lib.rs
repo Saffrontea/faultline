@@ -20,6 +20,7 @@ pub const ADDRESS_FAMILY_IPV6: u8 = 6;
 pub const LOSS_ALGORITHM_HASH: u8 = 0;
 pub const LOSS_ALGORITHM_RANDOM: u8 = 1;
 pub const LOSS_ALGORITHM_GILBERT_ELLIOTT: u8 = 2;
+pub const FRAGMENT_CACHE_TTL_NS: u64 = 30_000_000_000;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -157,6 +158,15 @@ pub fn serialization_delay_ns(packet_len: u32, bandwidth_bps: u64) -> u64 {
     let bounded_len = packet_len.min(1_000_000_000) as u64;
     let bits = bounded_len * 8;
     (bits * 1_000_000_000) / bandwidth_bps
+}
+
+/// Returns whether a fragment-port association has reached its time-to-live.
+///
+/// Saturating subtraction treats a timestamp observed slightly ahead of the
+/// current clock as fresh while expiring an entry at the exact TTL boundary.
+#[inline(always)]
+pub fn fragment_cache_entry_expired(now_ns: u64, seen_ns: u64) -> bool {
+    now_ns.saturating_sub(seen_ns) >= FRAGMENT_CACHE_TTL_NS
 }
 
 /// Advances one packet of a deterministic Gilbert-Elliott process.
@@ -348,6 +358,25 @@ mod tests {
             address_family: ADDRESS_FAMILY_IPV4,
             _padding: [0; 2],
         }
+    }
+
+    #[test]
+    fn fragment_cache_ttl_boundary_is_expired() {
+        let seen = 1_000_000_000;
+
+        assert!(!fragment_cache_entry_expired(
+            seen + FRAGMENT_CACHE_TTL_NS - 1,
+            seen
+        ));
+        assert!(fragment_cache_entry_expired(
+            seen + FRAGMENT_CACHE_TTL_NS,
+            seen
+        ));
+        assert!(fragment_cache_entry_expired(
+            seen + FRAGMENT_CACHE_TTL_NS + 1,
+            seen
+        ));
+        assert!(!fragment_cache_entry_expired(seen - 1, seen));
     }
 
     fn rule(drop_permyriad: u32, seed: u32) -> FaultRule {

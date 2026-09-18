@@ -503,6 +503,7 @@ logical segment数と`wire_len`から得たbyte数も集計します。GSO skb�
 | socket unit | `mise run lab:unit-sockets` | `faultline-lab`のloopback TCPと`faultline-engine`のUnix socket protocolをmise-agent経由で検証 |
 | userspace workspace | `mise run lab:unit-workspace` | `faultline-ebpf`を除く全crateをsocket制限のないmise-agent経由で一括検証 |
 | kernel integration | `mise run test-root` | `BPF_PROG_TEST_RUN`へ合成packetを渡し、IPv4/IPv6/VLAN/fragmentのmatchを検証 |
+| LRU境界 + LXC | `mise run lab:lru` | 容量1・満杯・1件超過、eviction後の再生成、sequence wrap、fragment/pacing LRUをkernelで検証後、LXC実通信を確認 |
 | LXC live control | `mise run lab:control` | faultline→Unix socket→map swap→実trafficとstats pushの往復を検証 |
 | ephemeral local agent | `mise run lab:agent` | TUI所有stdio session中だけ障害が有効で、終了後detachすることを検証 |
 | in-container LXC agent | `mise run lab:agent-lxc` | LXC netns内agentの適用とstdio EOF cleanupを検証 |

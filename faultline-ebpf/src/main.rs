@@ -17,8 +17,9 @@ use faultline_common::{
     LOSS_ALGORITHM_GILBERT_ELLIOTT, LOSS_ALGORITHM_HASH, LOSS_ALGORITHM_RANDOM,
     MAX_RULE_MAP_ENTRIES, MAX_RULES, PROTOCOL_ANY, PROTOCOL_TCP, PROTOCOL_UDP, PaceKey, PaceState,
     RULE_NAMESPACE_SOURCE_V4, RULE_NAMESPACE_SOURCE_V6, RULE_NODE_DESTINATION, RULE_NODE_SOURCE,
-    RuleNode, RuleStats, edt_base_ns, gilbert_elliott_step, seeded_delay_ns, seeded_hit,
-    serialization_delay_ns, should_drop_hash, should_drop_random_sample,
+    RuleNode, RuleStats, edt_base_ns, fragment_cache_entry_expired, gilbert_elliott_step,
+    seeded_delay_ns, seeded_hit, serialization_delay_ns, should_drop_hash,
+    should_drop_random_sample,
 };
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -462,8 +463,6 @@ fn parse_ip(
     }))
 }
 
-const FRAGMENT_CACHE_TTL_NS: u64 = 30_000_000_000;
-
 #[inline(always)]
 fn fragment_key(flow: &FlowKey, packet: &ParsedPacket) -> FragmentKey {
     FragmentKey {
@@ -492,7 +491,7 @@ fn fragment_ports(flow: &FlowKey, packet: &ParsedPacket) -> Option<(u16, u16)> {
     let key = fragment_key(flow, packet);
     let value = *unsafe { FRAGMENT_PORTS.get(key) }?;
     let now = unsafe { bpf_ktime_get_ns() };
-    if now.saturating_sub(value.seen_ns) > FRAGMENT_CACHE_TTL_NS {
+    if fragment_cache_entry_expired(now, value.seen_ns) {
         let _ = FRAGMENT_PORTS.remove(key);
         return None;
     }

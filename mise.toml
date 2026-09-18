@@ -48,14 +48,16 @@ run = "cargo test --workspace"
 [tasks.test-root]
 description = "Run kernel BPF_PROG_TEST_RUN integration tests"
 run = '''
-build_output=$(cargo test -p faultline-engine --test bpf_test_run --no-run 2>&1)
+build_output=$(cargo test -p faultline-engine --test bpf_test_run --test lru_boundaries --no-run 2>&1)
 printf '%s\n' "$build_output"
-test_binary=$(printf '%s\n' "$build_output" | sed -n 's/.*Executable tests\/bpf_test_run.rs (\(.*\))/\1/p' | tail -n 1)
-if [ -z "$test_binary" ]; then
-  echo "could not locate the bpf_test_run executable" >&2
-  exit 1
-fi
-./scripts/lab/sudo.sh "$test_binary" --ignored --nocapture
+for test_name in bpf_test_run lru_boundaries; do
+  test_binary=$(printf '%s\n' "$build_output" | sed -n "s/.*Executable tests\/$test_name.rs (\(.*\))/\1/p" | tail -n 1)
+  if [ -z "$test_binary" ]; then
+    echo "could not locate the $test_name executable" >&2
+    exit 1
+  fi
+  ./scripts/lab/sudo.sh "$test_binary" --ignored --nocapture
+done
 '''
 
 [tasks."lab:pbt"]
@@ -75,6 +77,21 @@ if [ -n "${FAULTLINE_PBT_CASE:-}" ]; then
 else
   ./scripts/lab/sudo.sh env FAULTLINE_PBT_SEED="$pbt_seed" FAULTLINE_PBT_CASES="$pbt_cases" "$test_binary" --ignored --nocapture
 fi
+'''
+
+[tasks."lab:lru"]
+description = "Exercise LRU capacity, eviction, reinsertion, and counter boundaries in the kernel"
+depends = ["build", "lab:up"]
+run = '''
+build_output=$(cargo test -p faultline-engine --test lru_boundaries --no-run 2>&1)
+printf '%s\n' "$build_output"
+test_binary=$(printf '%s\n' "$build_output" | sed -n 's/.*Executable tests\/lru_boundaries.rs (\(.*\))/\1/p' | tail -n 1)
+if [ -z "$test_binary" ]; then
+  echo "could not locate the lru_boundaries executable" >&2
+  exit 1
+fi
+./scripts/lab/sudo.sh "$test_binary" --ignored --nocapture
+./scripts/lab/sudo.sh env LOSS_MIN=30 LOSS_MAX=55 "$PWD/scripts/lab/loss.sh"
 '''
 
 [tasks."lab:pbt-long"]
