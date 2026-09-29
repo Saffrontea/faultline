@@ -331,6 +331,10 @@ impl BuilderApp {
             selectors: Vec::new(),
             profile,
             traffic,
+            outcome: self
+                .original
+                .as_deref()
+                .and_then(|value| value.outcome.clone()),
             extensions: self
                 .original
                 .as_deref()

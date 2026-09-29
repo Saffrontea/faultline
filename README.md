@@ -457,6 +457,29 @@ flt --experiment experiments/api-outage.yaml \
   --resolved-output /tmp/api-outage.resolved.json
 ```
 
+CIやtest harnessではterminalを描画せず、同じexperimentをheadless実行できます。詳細なexecution
+JSONをstdoutへ出し、`outcome.assertions`のどれかが不成立ならresolved artifactへ評価結果を保存した
+うえで非zero終了します。
+
+```bash
+flt --experiment experiments/lab-outage.yaml --headless \
+  --resolved-output /tmp/lab-outage.resolved.json
+```
+
+`outcome.assertions`はevent（0始まり）と、rule metricの場合はselectorでscopeを限定できます。
+比較演算子は`eq`、`ne`、`gt`、`gte`、`lt`、`lte`です。trafficには試行数、成功・失敗率、
+p50/p95/max所要時間、ruleにはmatched/drop/byte/action counter、diagnosticsには
+各miss/malformed counterを指定できます。観測が一件もないscopeは0とは見なさずassertion failureに
+なるため、「traffic自体が走らなかった」ケースを成功扱いしません。
+
+```yaml
+outcome:
+  assertions:
+    - { name: outage is visible, event: 1, metric: traffic.failure_percent, operator: gte, value: 80 }
+    - { name: injected drop occurred, event: 1, selector: default, metric: rule.dropped, operator: gt, value: 0 }
+    - { name: recovery is fast, event: 2, metric: traffic.duration_ms.p95, operator: lte, value: 200 }
+```
+
 manifestは持ち運び可能なartifactであり、YAMLを手書きする必要はありません。
 validationとcompileは`faultline-runtime`、provisioning、interface解決、resource lifetimeは
 `faultline-orchestrator::prepare_experiment`が担います。TUIも対話的に同じmodelを構築しますが、
@@ -471,6 +494,11 @@ rule observationはその設定に対してpacketがmatchしactionを受けた�
 ruleset切替後の最初のreportはintervalが旧generationをまたぐ可能性があるため、
 `interval_may_span_rule_change`で明示します。
 agentがruleを拒否した場合など、実験が完了しなかった理由は`execution_error`へ保存します。
+generated trafficは合計値だけでなく、各試行のsequence、開始・終了時刻、所要時間、開始時のevent、
+exit code、error、session終了時のcancel状態を`traffic_observations`へ保存します。
+終了処理がcancelしたin-flight試行は監査用には残しますがassertionの母数から除外します。
+outcome評価にはこの試行単位データと、
+event/selectorにscopeされたstats/diagnosticsのinterval deltaを使い、actual valueと合否を保存します。
 
 `delayed`はEDTを設定したskb数であり、end-to-end latencyの測定値ではありません。bandwidthは設定値と
 `wire_mbps`、`pacing_dropped`を並べて確認します。rule選択前のdestination/source/protocol/port missは

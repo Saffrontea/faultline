@@ -467,7 +467,7 @@ impl StatsReporter {
     }
 
     fn elapsed_ms(&self) -> u64 {
-        self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 }
 

@@ -22,6 +22,29 @@ traffic:
     - "150"
     - --require-success
   interval_ms: 100
+outcome:
+  assertions:
+    - name: baseline serves requests
+      event: 0
+      metric: traffic.success_percent
+      operator: gte
+      value: 80
+    - name: outage is visible to the application
+      event: 1
+      metric: traffic.failure_percent
+      operator: gte
+      value: 80
+    - name: outage packets were dropped by the selected rule
+      event: 1
+      selector: default
+      metric: rule.dropped
+      operator: gt
+      value: 0
+    - name: service recovers
+      event: 2
+      metric: traffic.success_percent
+      operator: gte
+      value: 80
 profile:
   duration_ms: 4000
   events:

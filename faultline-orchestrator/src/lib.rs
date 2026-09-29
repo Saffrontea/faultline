@@ -14,5 +14,5 @@ pub mod workload;
 
 pub use experiment::{PreparedExperiment, Tooling, capture_environment, prepare_experiment};
 pub use session::{Direction, Session, SessionOptions};
-pub use traffic::{TrafficGuard, TrafficStatus};
+pub use traffic::{TrafficAttempt, TrafficGuard, TrafficStatus};
 pub use workload::{Discovery, WorkloadGuard};

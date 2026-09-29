@@ -257,7 +257,7 @@ impl App {
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
-    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 pub(super) struct TerminalGuard;

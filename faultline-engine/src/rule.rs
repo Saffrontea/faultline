@@ -187,7 +187,7 @@ impl RuleInput {
 
 fn duration_ns(value: Option<Duration>) -> u64 {
     value
-        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 

@@ -123,6 +123,16 @@ impl<'a> ExperimentDriver<'a> {
             .unwrap_or_default()
     }
 
+    /// Stop and reap any in-flight generator command before taking the final
+    /// detailed observation snapshot.
+    pub fn finish_traffic(&mut self) -> TrafficStatus {
+        let Some(mut traffic) = self.traffic.take() else {
+            return TrafficStatus::default();
+        };
+        traffic.stop();
+        traffic.status()
+    }
+
     pub fn complete(&self, elapsed: Duration) -> bool {
         self.timeline.complete(elapsed)
     }

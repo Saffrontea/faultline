@@ -76,11 +76,13 @@ pub fn capture_environment(attach: &AttachSpec) -> ExecutionEnvironment {
     .cloned()
     .collect();
     ExecutionEnvironment {
-        captured_at_unix_ms: SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u64::MAX as u128) as u64,
+        captured_at_unix_ms: u64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX),
         target: attach.target_uri(),
         interface,
         faultline_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -178,6 +180,7 @@ mod tests {
                 }],
             },
             traffic: None,
+            outcome: None,
             extensions: BTreeMap::new(),
         };
         let prepared = prepare_experiment(

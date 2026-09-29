@@ -130,6 +130,11 @@ struct Options {
     /// print the screen as text, and exit. Intended for UI integration tests.
     #[arg(long, conflicts_with_all = ["profile", "replay", "record", "set_loss"])]
     snapshot_after_ms: Option<u64>,
+
+    /// Run an experiment without entering the terminal UI, emit the detailed
+    /// execution/outcome JSON, and fail when an outcome assertion fails.
+    #[arg(long, conflicts_with = "snapshot_after_ms")]
+    headless: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -166,6 +171,7 @@ impl Options {
 
 fn main() -> anyhow::Result<()> {
     let mut options = Options::parse();
+    validate_options(&options)?;
     if let Some(paths) = &options.compare_resolved {
         return compare_resolved_experiments(&paths[0], &paths[1]);
     }
@@ -192,6 +198,13 @@ fn main() -> anyhow::Result<()> {
     let session = Session::open(&options.session_options())?;
     record_effective_environment(&mut prepared)?;
     run_session(&options, session, playback, &mut prepared)
+}
+
+fn validate_options(options: &Options) -> anyhow::Result<()> {
+    if options.headless && options.experiment.is_none() && options.rerun_resolved.is_none() {
+        bail!("--headless requires --experiment or --rerun-resolved");
+    }
+    Ok(())
 }
 
 enum PlanInput {
@@ -411,6 +424,7 @@ fn run_playback_session(
         &label,
         traffic_plan.as_ref(),
         options.snapshot_after_ms,
+        options.headless,
     );
     stop_owned_session(owned, &mut *writer)?;
     drop(writer);
@@ -419,7 +433,25 @@ fn run_playback_session(
         Ok(execution) => {
             plan.execution = Some(execution);
             plan.execution_error = None;
-            write_resolved_plan(prepared.resolved_path.as_deref(), plan, "completed")
+            let outcome_passed = plan
+                .evaluate_outcome()
+                .map_err(anyhow::Error::msg)?
+                .is_none_or(|outcome| outcome.passed);
+            write_resolved_plan(prepared.resolved_path.as_deref(), plan, "completed")?;
+            if options.headless {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        plan.execution
+                            .as_ref()
+                            .expect("execution was just recorded")
+                    )?
+                );
+            }
+            if !outcome_passed {
+                bail!("one or more outcome assertions failed");
+            }
+            Ok(())
         }
         Err(error) => {
             plan.execution_error = Some(format!("{error:#}"));
@@ -754,6 +786,32 @@ mod tests {
     }
 
     #[test]
+    fn headless_is_an_experiment_mode_and_conflicts_with_snapshot_rendering() {
+        let options = Options::try_parse_from([
+            FLT_APPLICATION,
+            "--experiment",
+            "experiment.yaml",
+            "--headless",
+        ])
+        .unwrap();
+        assert!(options.headless);
+        validate_options(&options).unwrap();
+        let without_experiment = Options::try_parse_from([FLT_APPLICATION, "--headless"]).unwrap();
+        assert!(validate_options(&without_experiment).is_err());
+        assert!(
+            Options::try_parse_from([
+                FLT_APPLICATION,
+                "--experiment",
+                "experiment.yaml",
+                "--headless",
+                "--snapshot-after-ms",
+                "100",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn frozen_resolved_plan_has_an_explicit_rerun_path() {
         let options = Options::try_parse_from([
             FLT_APPLICATION,
@@ -899,7 +957,9 @@ mod tests {
             attempts: 12,
             succeeded: 9,
             failed: 3,
+            cancelled: 0,
             last_error: None,
+            observations: Vec::new(),
         };
         let rendered = screen(&render(&app, 150, 32));
         assert!(rendered.contains("✓ Provision → ✓ Connect → ● Impair → Observe"));

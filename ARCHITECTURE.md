@@ -232,6 +232,12 @@ observed experimentではevent 0の完全なsnapshot rulesetが`applied`にな�
 各eventも直前のack後にだけ送るため、複数のIPv4/IPv6 destinationを持つ場合も最初のrequestから
 観測対象となり、遅いmap更新でtimeline commandが追い越しません。
 
+各traffic commandは合計counterに加えて開始・終了、duration、exit codeを記録します。
+開始時刻をack済みevent境界と照合するため、eventをまたいで完了したrequestも開始時のfault stateへ
+帰属します。manifestの`outcome.assertions`はこのrequest列、rule stats delta、selection diagnosticsを
+event/selector単位で評価します。`--headless`は同じobserved adapterを描画なしで最後まで駆動し、
+execution JSONを出力してassertion failureをprocess exit statusへ反映します。
+
 ```mermaid
 sequenceDiagram
     participant UI as frontend

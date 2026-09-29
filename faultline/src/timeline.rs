@@ -11,6 +11,7 @@ use crossterm::event::{self, Event, KeyCode};
 use faultline_protocol::{ControlTimeouts, Request, RuleSpec, Timeline, encode_line};
 use faultline_runtime::{
     AppliedEventRecord, ExperimentExecution, RuleObservation, SelectionDiagnosticObservation,
+    TrafficObservation,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use serde_json::Value;
@@ -28,6 +29,7 @@ pub(super) fn run_observed(
         faultline_runtime::TrafficSpec,
     )>,
     snapshot_after_ms: Option<u64>,
+    headless: bool,
 ) -> anyhow::Result<ExperimentExecution> {
     run_observed_with_timeouts(
         timeline,
@@ -35,9 +37,18 @@ pub(super) fn run_observed(
         writer,
         label,
         traffic_plan,
-        snapshot_after_ms,
+        ObservationMode {
+            snapshot_after_ms,
+            headless,
+        },
         ControlTimeouts::default(),
     )
+}
+
+#[derive(Clone, Copy)]
+struct ObservationMode {
+    snapshot_after_ms: Option<u64>,
+    headless: bool,
 }
 
 fn run_observed_with_timeouts(
@@ -49,9 +60,13 @@ fn run_observed_with_timeouts(
         faultline_runtime::AttachSpec,
         faultline_runtime::TrafficSpec,
     )>,
-    snapshot_after_ms: Option<u64>,
+    mode: ObservationMode,
     timeouts: ControlTimeouts,
 ) -> anyhow::Result<ExperimentExecution> {
+    let ObservationMode {
+        snapshot_after_ms,
+        headless,
+    } = mode;
     let (messages, incoming) = mpsc::channel();
     thread::spawn(move || {
         for line in BufReader::new(reader).lines() {
@@ -68,12 +83,9 @@ fn run_observed_with_timeouts(
     if snapshot_after_ms == Some(0) {
         bail!("--snapshot-after-ms must be greater than zero");
     }
-    let guard = snapshot_after_ms
-        .is_none()
-        .then(TerminalGuard::enter)
-        .transpose()?;
-    let mut terminal = snapshot_after_ms
-        .is_none()
+    let interactive = snapshot_after_ms.is_none() && !headless;
+    let guard = interactive.then(TerminalGuard::enter).transpose()?;
+    let mut terminal = interactive
         .then(|| Terminal::new(CrosstermBackend::new(stdout())))
         .transpose()?;
     let mut app = App::new();
@@ -141,6 +153,7 @@ fn run_observed_with_timeouts(
             }
         }
         app.traffic = driver.traffic_status();
+        observations.traffic(&app.traffic);
         if let Some(terminal) = &mut terminal {
             terminal.draw(|frame| draw(frame, &app, label))?;
         }
@@ -165,6 +178,8 @@ fn run_observed_with_timeouts(
     if snapshot_after_ms.is_some() {
         print!("{}", render_snapshot(&app, label, 140, 32)?);
     }
+    let final_traffic = driver.finish_traffic();
+    observations.traffic(&final_traffic);
     drop(terminal);
     drop(guard);
     Ok(observations.finish(started_at_unix_ms))
@@ -189,6 +204,8 @@ struct ObservationRecorder {
     selection_diagnostics: Vec<SelectionDiagnosticObservation>,
     final_rule_stats: BTreeMap<u32, Value>,
     final_diagnostics: Option<Value>,
+    traffic_observations: Vec<TrafficObservation>,
+    recorded_traffic_attempts: usize,
 }
 
 impl ObservationRecorder {
@@ -243,6 +260,30 @@ impl ObservationRecorder {
             });
     }
 
+    fn traffic(&mut self, status: &faultline_orchestrator::TrafficStatus) {
+        for attempt in status
+            .observations
+            .iter()
+            .skip(self.recorded_traffic_attempts)
+        {
+            self.traffic_observations.push(TrafficObservation {
+                sequence: attempt.sequence,
+                // Assigned from the attempt start time and acknowledged event
+                // boundaries in finish(), so a slow request crossing a fault
+                // transition remains attributed to the state it started in.
+                active_event_index: None,
+                started_at_unix_ms: attempt.started_at_unix_ms,
+                completed_at_unix_ms: attempt.completed_at_unix_ms,
+                duration_ms: attempt.duration_ms,
+                success: attempt.success,
+                cancelled: attempt.cancelled,
+                exit_code: attempt.exit_code,
+                error: attempt.error.clone(),
+            });
+        }
+        self.recorded_traffic_attempts = status.observations.len();
+    }
+
     fn applied(&mut self, event_index: usize, elapsed: Duration) {
         let Some(pending) = self.pending.take() else {
             return;
@@ -253,6 +294,7 @@ impl ObservationRecorder {
             scheduled_at_ms: pending.scheduled_at_ms,
             requested_at_ms: pending.requested_at_ms,
             applied_at_ms: duration_ms(elapsed),
+            applied_at_unix_ms: unix_ms(),
             rule_ids: pending.rules.iter().map(|rule| rule.id).collect(),
         });
         self.active_event_index = Some(event_index);
@@ -270,29 +312,39 @@ impl ObservationRecorder {
         self.pending.is_some()
     }
 
-    fn finish(self, started_at_unix_ms: u64) -> ExperimentExecution {
+    fn finish(mut self, started_at_unix_ms: u64) -> ExperimentExecution {
+        for attempt in &mut self.traffic_observations {
+            attempt.active_event_index = self
+                .applied_events
+                .iter()
+                .rev()
+                .find(|event| event.applied_at_unix_ms <= attempt.started_at_unix_ms)
+                .map(|event| event.event_index);
+        }
         ExperimentExecution {
             started_at_unix_ms,
             completed_at_unix_ms: unix_ms(),
             applied_events: self.applied_events,
             rule_observations: self.rule_observations,
             selection_diagnostics: self.selection_diagnostics,
+            traffic_observations: self.traffic_observations,
             final_rule_stats: self.final_rule_stats,
             final_diagnostics: self.final_diagnostics,
+            outcome: None,
         }
     }
 }
 
 fn duration_ms(duration: Duration) -> u64 {
-    duration.as_millis().min(u64::MAX as u128) as u64
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn unix_ms() -> u64 {
-    SystemTime::now()
+    let millis = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis()
-        .min(u64::MAX as u128) as u64
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -441,6 +493,7 @@ mod tests {
             "test://timeline",
             None,
             Some(30),
+            false,
         )
         .unwrap();
         assert_eq!(execution.applied_events.len(), 2);
@@ -494,7 +547,10 @@ mod tests {
             &mut writer,
             "test://timeline",
             None,
-            Some(1),
+            ObservationMode {
+                snapshot_after_ms: Some(1),
+                headless: false,
+            },
             ControlTimeouts {
                 acknowledgement: Duration::from_millis(20),
                 ..ControlTimeouts::default()
@@ -503,5 +559,70 @@ mod tests {
         .unwrap_err();
         assert!(request_rx.recv().is_ok());
         assert!(error.to_string().contains("acknowledgement timed out"));
+    }
+
+    #[test]
+    fn traffic_attempts_are_attributed_by_start_time_across_event_boundaries() {
+        let mut recorder = ObservationRecorder::default();
+        recorder.requested(
+            &ApplyEvent {
+                id: 1,
+                index: 0,
+                at_ms: 0,
+                rules: Vec::new(),
+            },
+            Duration::ZERO,
+        );
+        recorder.applied(0, Duration::from_millis(5));
+        recorder.requested(
+            &ApplyEvent {
+                id: 2,
+                index: 1,
+                at_ms: 50,
+                rules: Vec::new(),
+            },
+            Duration::from_millis(50),
+        );
+        recorder.applied(1, Duration::from_millis(55));
+        recorder.applied_events[0].applied_at_unix_ms = 1_005;
+        recorder.applied_events[1].applied_at_unix_ms = 1_055;
+        recorder.traffic(&faultline_orchestrator::TrafficStatus {
+            attempts: 2,
+            succeeded: 1,
+            failed: 1,
+            cancelled: 0,
+            last_error: None,
+            observations: vec![
+                faultline_orchestrator::TrafficAttempt {
+                    sequence: 1,
+                    started_at_unix_ms: 1_040,
+                    completed_at_unix_ms: 1_070,
+                    duration_ms: 30,
+                    success: false,
+                    cancelled: false,
+                    exit_code: Some(1),
+                    error: None,
+                },
+                faultline_orchestrator::TrafficAttempt {
+                    sequence: 2,
+                    started_at_unix_ms: 1_060,
+                    completed_at_unix_ms: 1_065,
+                    duration_ms: 5,
+                    success: true,
+                    cancelled: false,
+                    exit_code: Some(0),
+                    error: None,
+                },
+            ],
+        });
+        let execution = recorder.finish(1_000);
+        assert_eq!(
+            execution.traffic_observations[0].active_event_index,
+            Some(0)
+        );
+        assert_eq!(
+            execution.traffic_observations[1].active_event_index,
+            Some(1)
+        );
     }
 }

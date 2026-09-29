@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Context as _;
@@ -18,21 +18,38 @@ pub struct TrafficStatus {
     pub attempts: u64,
     pub succeeded: u64,
     pub failed: u64,
+    pub cancelled: u64,
     pub last_error: Option<String>,
+    pub observations: Vec<TrafficAttempt>,
 }
 
 impl TrafficStatus {
-    fn record(&mut self, result: anyhow::Result<bool>) {
+    fn record(&mut self, observation: TrafficAttempt) {
         self.attempts += 1;
-        match result {
-            Ok(true) => self.succeeded += 1,
-            Ok(false) => self.failed += 1,
-            Err(error) => {
-                self.failed += 1;
-                self.last_error = Some(error.to_string());
+        if observation.cancelled {
+            self.cancelled += 1;
+        } else if observation.success {
+            self.succeeded += 1;
+        } else {
+            self.failed += 1;
+            if let Some(error) = &observation.error {
+                self.last_error = Some(error.clone());
             }
         }
+        self.observations.push(observation);
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrafficAttempt {
+    pub sequence: u64,
+    pub started_at_unix_ms: u64,
+    pub completed_at_unix_ms: u64,
+    pub duration_ms: u64,
+    pub success: bool,
+    pub cancelled: bool,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
 }
 
 pub struct TrafficGuard {
@@ -67,14 +84,18 @@ impl TrafficGuard {
             .map(|value| value.clone())
             .unwrap_or_default()
     }
-}
 
-impl Drop for TrafficGuard {
-    fn drop(&mut self) {
+    pub fn stop(&mut self) {
         self.cancel.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+impl Drop for TrafficGuard {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -131,9 +152,31 @@ fn run(
 ) {
     while !cancel.load(Ordering::Acquire) {
         let started = Instant::now();
+        let sequence = status.lock().map(|status| status.attempts + 1).unwrap_or(1);
+        let started_at_unix_ms = unix_ms();
         let result = run_once(&cancel, &invocation);
+        let completed_at_unix_ms = unix_ms();
+        let (success, cancelled, exit_code, error) = match result {
+            Ok(result) => (
+                result.status.success(),
+                result.cancelled,
+                result.status.code(),
+                None,
+            ),
+            Err(error) => (false, false, None, Some(error.to_string())),
+        };
+        let observation = TrafficAttempt {
+            sequence,
+            started_at_unix_ms,
+            completed_at_unix_ms,
+            duration_ms: completed_at_unix_ms.saturating_sub(started_at_unix_ms),
+            success,
+            cancelled,
+            exit_code,
+            error,
+        };
         if let Ok(mut status) = status.lock() {
-            status.record(result);
+            status.record(observation);
         }
         let remaining = interval.saturating_sub(started.elapsed());
         let deadline = Instant::now() + remaining;
@@ -147,7 +190,7 @@ fn run(
     }
 }
 
-fn run_once(cancel: &AtomicBool, invocation: &Invocation) -> anyhow::Result<bool> {
+fn run_once(cancel: &AtomicBool, invocation: &Invocation) -> anyhow::Result<AttemptExit> {
     let mut child = Command::new(&invocation.program)
         .args(&invocation.args)
         .stdin(Stdio::null())
@@ -157,19 +200,42 @@ fn run_once(cancel: &AtomicBool, invocation: &Invocation) -> anyhow::Result<bool
         .with_context(|| format!("starting traffic command {}", invocation.program))?;
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(status.success());
+            return Ok(AttemptExit {
+                status,
+                cancelled: false,
+            });
         }
         if cancel.load(Ordering::Acquire) {
             let _ = child.kill();
-            let _ = child.wait();
-            return Ok(false);
+            let status = child
+                .wait()
+                .context("waiting for cancelled traffic command")?;
+            return Ok(AttemptExit {
+                status,
+                cancelled: true,
+            });
         }
         thread::sleep(Duration::from_millis(25));
     }
 }
 
+struct AttemptExit {
+    status: std::process::ExitStatus,
+    cancelled: bool,
+}
+
+fn unix_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use faultline_runtime::{DockerProvision, WorkloadLifecycle};
 
     use super::*;
@@ -247,5 +313,36 @@ mod tests {
         );
         assert_eq!(invocation.program, "psql");
         assert_eq!(invocation.args[1], "select 1; drop nothing");
+    }
+
+    #[test]
+    fn traffic_guard_preserves_attempt_level_timing_and_exit_status() {
+        let spec = TrafficSpec::Command {
+            program: "true".into(),
+            args: Vec::new(),
+            interval_ms: 1_000,
+        };
+        let mut guard = TrafficGuard::start(
+            &AttachSpec::Local {
+                interface: "lo".into(),
+                process: None,
+            },
+            &spec,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while guard.status().observations.is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        guard.stop();
+        let status = guard.status();
+        assert_eq!(status.attempts, 1);
+        assert_eq!(status.succeeded, 1);
+        assert_eq!(status.observations[0].exit_code, Some(0));
+        assert!(!status.observations[0].cancelled);
+        assert!(
+            status.observations[0].completed_at_unix_ms
+                >= status.observations[0].started_at_unix_ms
+        );
     }
 }
