@@ -12,8 +12,12 @@ fn main() -> anyhow::Result<()> {
         .join("scripts/rustc-bpf-v3.sh");
     println!("cargo:rerun-if-changed={}", rustc_wrapper.display());
     if let Some(existing) = env::var_os("RUSTC_WRAPPER") {
+        // SAFETY: this build script has not spawned any threads, so no other
+        // thread in this process can concurrently access the environment.
         unsafe { env::set_var("FAULTLINE_RUSTC_WRAPPER_NEXT", existing) };
     }
+    // SAFETY: this build script has not spawned any threads, so no other
+    // thread in this process can concurrently access the environment.
     unsafe { env::set_var("RUSTC_WRAPPER", rustc_wrapper) };
 
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()

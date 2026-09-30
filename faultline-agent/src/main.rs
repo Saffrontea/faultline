@@ -114,7 +114,15 @@ impl Drop for EngineGuard {
         // BPF descriptors but skips PacingGuard, leaving the qdisc behind.
         // Allow bounded graceful cleanup even if the stdio consumer vanished.
         if matches!(self.child.try_wait(), Ok(None)) {
-            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) };
+            if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+                // SAFETY: kill takes no userspace pointers. Child::id supplies
+                // a positive process id, and the checked conversion prevents
+                // wrapping into kill's zero/negative process-group selectors,
+                // so this targets that one child with the valid SIGTERM value.
+                // The guard does not reap it until after this call, preventing
+                // PID reuse if it exits after the try_wait check.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while std::time::Instant::now() < deadline {
                 match self.child.try_wait() {
@@ -173,7 +181,10 @@ impl Options {
 fn install_parent_death_signal(command: &mut Command) {
     // Do not leave the privileged dataplane behind if this ephemeral agent is
     // terminated before it can forward the normal protocol Stop request.
+    // SAFETY: getpid takes no arguments and has no memory-safety preconditions.
     let expected_parent = unsafe { libc::getpid() };
+    // SAFETY: the closure only captures a Copy pid and calls async-signal-safe
+    // process-control syscalls between fork and exec; it performs no allocation.
     unsafe {
         command.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
@@ -183,9 +194,7 @@ fn install_parent_death_signal(command: &mut Command) {
             // PDEATHSIG was armed too late, so fail the exec instead of leaving
             // a privileged, reparented engine behind.
             if libc::getppid() != expected_parent {
-                return Err(std::io::Error::other(format!(
-                    "{APPLICATION_NAME} parent exited before PDEATHSIG was installed"
-                )));
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
             }
             Ok(())
         });
@@ -323,6 +332,8 @@ mod tests {
             .unwrap();
         // Force stats backpressure while keeping the output reader open.
         assert!(
+            // SAFETY: the ChildStdout remains owned by child for the duration
+            // of the call, so its raw fd is open; F_SETPIPE_SZ accepts an int.
             unsafe {
                 libc::fcntl(
                     child.stdout.as_ref().unwrap().as_raw_fd(),
@@ -407,7 +418,9 @@ mod tests {
             return;
         };
         let mut command = Command::new("/bin/sleep");
-        command.arg("30");
+        // Keep a failed test self-cleaning without signalling a PID whose
+        // identity cannot be pinned after this helper exits.
+        command.arg("5");
         install_parent_death_signal(&mut command);
         let child = command.spawn().unwrap();
         fs::write(path, child.id().to_string()).unwrap();
@@ -437,7 +450,6 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        unsafe { libc::kill(pid, libc::SIGKILL) };
         let _ = fs::remove_file(&marker);
         panic!("engine process {pid} survived its parent");
     }

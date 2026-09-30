@@ -6,6 +6,9 @@ license.workspace = true
 description = "Interactive frontend for repeatable network fault experiments"
 autobins = false
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "flt"
 path = "src/main.rs"

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Ephemeral workload-namespace worker for one network fault session"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = { workspace = true, default-features = true }
 faultline-common = { path = "../faultline-common" }

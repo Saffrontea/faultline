@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Portable experiment model, validation, and execution-plan compiler"
 
+[lints]
+workspace = true
+
 [dependencies]
 faultline-common = { path = "../faultline-common" }
 faultline-protocol = { path = "../faultline-protocol" }

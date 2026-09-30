@@ -6,6 +6,9 @@ license.workspace = true
 description = "Low-level Aya and TC eBPF engine for network fault sessions"
 autobins = false
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "faultline-engine"
 path = "src/main.rs"
