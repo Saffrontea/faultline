@@ -575,3 +575,15 @@ LXCの全経路は、対話terminalなしで検証できます。
 ```bash
 mise run lab:experiment
 ```
+
+## ライセンス
+
+userspace crateと`faultline-common`は、[MIT](LICENSE-MIT)または
+[Apache License 2.0](LICENSE-APACHE)のいずれかを選択できます。
+
+`faultline-ebpf`は、[MIT](LICENSE-MIT)または
+[GNU GPL version 2](LICENSE-GPL-2.0)のいずれかを選択できます。eBPF objectの
+`license` sectionも、このcrateのライセンスに合わせて`Dual MIT/GPL`を宣言します。
+`mise run licenses`はproject内の宣言と依存crateのライセンス許可リストを検査し、
+さらに`faultline-ebpf`の依存closureにGPL-2.0-only互換の選択肢があることを検査します。
+この検査は`mise run check`からも実行されます。

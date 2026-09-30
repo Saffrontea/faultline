@@ -1,0 +1,10 @@
+# Licenses that may be combined into the GPL-2.0-only eBPF object.
+# Apache-2.0 is deliberately absent: `Apache-2.0 OR MIT` dependencies pass
+# through their MIT option, while Apache-2.0-only dependencies are rejected.
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "GPL-2.0-only",
+    "MIT",
+    "Unicode-3.0",
+]

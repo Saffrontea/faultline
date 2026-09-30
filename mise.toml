@@ -1,5 +1,6 @@
 [tools]
 cargo-binstall = "latest"
+cargo-deny = "0.20.2"
 
 [tasks.setup]
 description = "Install the Rust toolchains and bpf-linker required by Aya"
@@ -10,10 +11,19 @@ cargo binstall --no-confirm bpf-linker
 """
 
 [tasks.check]
-description = "Format-check and compile the userspace and eBPF programs"
+description = "Check licenses, formatting, and userspace/eBPF compilation"
+depends = ["licenses"]
 run = """
 cargo fmt --all -- --check
 cargo check
+"""
+
+[tasks.licenses]
+description = "Verify project license declarations and dependency licenses"
+run = """
+./scripts/check-licenses.sh
+cargo deny check licenses
+cargo deny --manifest-path faultline-ebpf/Cargo.toml --config deny-gpl.toml check licenses
 """
 
 [tasks.lint-userspace]

@@ -829,4 +829,5 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 #[unsafe(link_section = "license")]
 #[unsafe(no_mangle)]
+// Keep this loader-visible declaration aligned with the crate's source license.
 static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
