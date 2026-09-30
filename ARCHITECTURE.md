@@ -402,9 +402,9 @@ flowchart TD
 | map | 型 | 役割 |
 | --- | --- | --- |
 | `RULES` | `ArrayOfMaps<LpmTrie<_, RuleNode>>` | slot 0がactive generation。destination lookupとsource lookupを名前空間分離した同一inner LPMで行う |
-| `FLOW_STATE` | `LruHashMap` (65,536) | flow×rule×generation単位のpacket sequenceとGE state |
-| `FRAGMENT_PORTS` | `LruHashMap` (32,768) | 初回fragmentのportを30秒だけ後続fragmentへ引き継ぐ |
-| `PACE_STATE` | `LruHashMap<PaceKey, PaceState>` | rule×generationごとのaggregate bandwidth clock。旧generationはLRU eviction |
+| `FLOW_STATE` | `HashMap` + `BPF_F_NO_PREALLOC` (65,536) | flow×rule×generation単位のpacket sequenceとGE state。旧generationはpublish後にuserspaceが削除し、満杯時の新規flowはstateなしで安全側へ縮退 |
+| `FRAGMENT_PORTS` | `HashMap` + `BPF_F_NO_PREALLOC` (32,768) | 初回fragmentのportを30秒だけ後続fragmentへ引き継ぐ。満杯時の新規fragmentはport miss |
+| `PACE_STATE` | `HashMap<PaceKey, PaceState>` + `BPF_F_NO_PREALLOC` | rule×generationごとのaggregate bandwidth clock。旧generationはruleset publish後にuserspaceが削除 |
 | `STATS` | `PerCpuArray<RuleStats>` | ruleごとのcounter。userspaceが全CPUを合算 |
 | `DIAGNOSTICS` | `PerCpuArray<DiagnosticStats>` (1 entry) | rule決定前のparser・CIDR・protocol・port missとclone bypass |
 
@@ -509,7 +509,7 @@ logical segment数と`wire_len`から得たbyte数も集計します。GSO skb�
 | socket unit | `mise run lab:unit-sockets` | `faultline-lab`のloopback TCPと`faultline-engine`のUnix socket protocolをmise-agent経由で検証 |
 | userspace workspace | `mise run lab:unit-workspace` | `faultline-ebpf`を除く全crateをsocket制限のないmise-agent経由で一括検証 |
 | kernel integration | `mise run test-root` | `BPF_PROG_TEST_RUN`へ合成packetを渡し、IPv4/IPv6/VLAN/fragmentのmatchを検証 |
-| LRU境界 + LXC | `mise run lab:lru` | 容量1・満杯・1件超過、eviction後の再生成、sequence wrap、fragment/pacing LRUをkernelで検証後、LXC実通信を確認 |
+| state map境界 + LXC | `mise run lab:lru` | 容量1・満杯・1件超過でslotを別keyへ再利用しないこと、sequence wrap、fragment miss、pacing fail-closedをkernelで検証後、LXC実通信を確認 |
 | LXC live control | `mise run lab:control` | faultline→Unix socket→map swap→実trafficとstats pushの往復を検証 |
 | ephemeral local agent | `mise run lab:agent` | TUI所有stdio session中だけ障害が有効で、終了後detachすることを検証 |
 | in-container LXC agent | `mise run lab:agent-lxc` | LXC netns内agentの適用とstdio EOF cleanupを検証 |
@@ -543,7 +543,9 @@ TCP client/server/transferを提供し、成功率・所要時間・分散のass
 ## 既知の構造上の制限
 
 - scenario fileのwatch/reloadは未実装です。live rule更新はUnix control socketで行えます。
-- 複数ruleの差し替えはmap-in-mapのinner LPM交換によりgeneration単位でatomicです。
+- 複数ruleの差し替えはmap-in-mapのinner LPM交換によりgeneration単位でatomicです。旧generationの
+  `FLOW_STATE` / `PACE_STATE` は交換後に削除され、`BPF_F_NO_PREALLOC` によりin-flight lookupの
+  allocationは別keyへ再利用されません。
 - inline VLANは2段（QinQ）、IPv6 extension headerは6段まで。
 - fragmentは初回fragmentが先に到着した場合のみportでmatchできます。
 - EDT pacingはinterfaceのroot qdiscとして`sch_fq`を一時的に占有します。(メインの想定はDocker,LXCなので許容している。)

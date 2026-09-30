@@ -422,8 +422,8 @@ eBPF mapは次の役割です。
 
 - `RULES`: active generationのinner LPMを保持する`ArrayOfMaps`。family＋宛先CIDRから
   `destination_id`を引き、同じinner LPMを`destination_id`＋source CIDRで再検索
-- `FLOW_STATE`: flow、rule、generationごとのpacket sequenceを持つ共有`LruHashMap`
-- `PACE_STATE`: ruleとgenerationごとのaggregate bandwidth clockを持つ`LruHashMap`
+- `FLOW_STATE`: flow、rule、generationごとのpacket sequenceを持つ共有`HashMap`（`BPF_F_NO_PREALLOC`、旧generationはpublish後に削除）
+- `PACE_STATE`: ruleとgenerationごとのaggregate bandwidth clockを持つ`HashMap`（`BPF_F_NO_PREALLOC`、旧generationはpublish後に削除）
 - `STATS`: ruleごとの`PerCpuArray`
 - `DIAGNOSTICS`: rule決定前のparser・CIDR・protocol・port missを持つglobal `PerCpuArray`
 

@@ -5,16 +5,16 @@
 
 use aya_ebpf::{
     EbpfContext,
-    bindings::{__sk_buff, BPF_ANY, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_SHOT},
+    bindings::{__sk_buff, BPF_ANY, BPF_F_NO_PREALLOC, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_SHOT},
     btf_maps::{ArrayOfMaps, LpmTrie as BtfLpmTrie},
     helpers::{bpf_get_prandom_u32, bpf_ktime_get_ns},
     macros::{btf_map, classifier, map},
-    maps::{LruHashMap, PerCpuArray, lpm_trie::Key},
+    maps::{HashMap, PerCpuArray, lpm_trie::Key},
     programs::TcContext,
 };
 use faultline_common::{
-    ADDRESS_FAMILY_IPV4, ADDRESS_FAMILY_IPV6, DiagnosticStats, FaultRule, FlowKey,
-    LOSS_ALGORITHM_GILBERT_ELLIOTT, LOSS_ALGORITHM_HASH, LOSS_ALGORITHM_RANDOM,
+    ADDRESS_FAMILY_IPV4, ADDRESS_FAMILY_IPV6, DiagnosticStats, FaultRule, FlowKey, FlowState,
+    FlowStateKey, LOSS_ALGORITHM_GILBERT_ELLIOTT, LOSS_ALGORITHM_HASH, LOSS_ALGORITHM_RANDOM,
     MAX_RULE_MAP_ENTRIES, MAX_RULES, PROTOCOL_ANY, PROTOCOL_TCP, PROTOCOL_UDP, PaceKey, PaceState,
     RULE_NAMESPACE_SOURCE_V4, RULE_NAMESPACE_SOURCE_V6, RULE_NODE_DESTINATION, RULE_NODE_SOURCE,
     RuleNode, RuleStats, edt_base_ns, fragment_cache_entry_expired, gilbert_elliott_step,
@@ -30,23 +30,6 @@ const ETHERNET_HEADER_LEN: usize = 14;
 const VLAN_HEADER_LEN: usize = 4;
 const MAX_VLAN_DEPTH: usize = 2;
 const CAS_RETRIES: usize = 2;
-
-// This value lives in a shared (not per-CPU) map. Keeping the state global makes
-// hash and Gilbert-Elliott sequences deterministic even when one flow moves
-// between CPUs. Both words are updated atomically by their respective paths.
-#[repr(C)]
-struct AtomicFlowState {
-    packet_index: u64,
-    ge_state: u64,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct FlowStateKey {
-    flow: FlowKey,
-    rule_id: u32,
-    generation: u32,
-}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -77,19 +60,26 @@ type RuleLpm = BtfLpmTrie<[u8; 24], RuleNode, { MAX_RULE_MAP_ENTRIES as usize }>
 #[btf_map]
 static RULES: ArrayOfMaps<RuleLpm, 1> = ArrayOfMaps::new();
 
-// Flow state is keyed by five-tuple, rule ID and generation, bounded, and automatically
-// evicted. Eviction only restarts the deterministic sequence for that flow and
-// rule; it never allows this map to grow without limit.
+// BPF_F_NO_PREALLOC is essential for all three hash maps below. A preallocated
+// hash/LRU map may recycle a removed or evicted slot for another key while a
+// concurrent program still holds its value pointer. Non-preallocated hash maps
+// retire removed allocations after an RCU grace period instead, so a lookup
+// pointer cannot start referring to another key during this invocation.
+//
+// Flow state remains bounded. At capacity, a new flow cannot allocate state and
+// safely falls back to sequence zero rather than evicting a live value slot.
 #[map]
-static FLOW_STATE: LruHashMap<FlowStateKey, AtomicFlowState> =
-    LruHashMap::with_max_entries(65_536, 0);
+static FLOW_STATE: HashMap<FlowStateKey, FlowState> =
+    HashMap::with_max_entries(65_536, BPF_F_NO_PREALLOC);
 
 // IP fragments are associated only long enough to carry the first fragment's
-// transport ports to later fragments. LRU bounds memory under hostile IDs;
-// timestamp validation prevents an old ID collision from living indefinitely.
+// transport ports to later fragments. The fixed capacity bounds memory under
+// hostile IDs; timestamp validation rejects an old ID collision. At capacity,
+// remembering a new ID fails closed and its later fragments do not match a
+// port-specific rule.
 #[map]
-static FRAGMENT_PORTS: LruHashMap<FragmentKey, FragmentPorts> =
-    LruHashMap::with_max_entries(32_768, 0);
+static FRAGMENT_PORTS: HashMap<FragmentKey, FragmentPorts> =
+    HashMap::with_max_entries(32_768, BPF_F_NO_PREALLOC);
 
 // Statistics do not need a cross-CPU atomic operation. Each CPU updates its own
 // slot and userspace sums all slots when it emits a snapshot.
@@ -100,9 +90,11 @@ static STATS: PerCpuArray<RuleStats> = PerCpuArray::with_max_entries(MAX_RULES, 
 static DIAGNOSTICS: PerCpuArray<DiagnosticStats> = PerCpuArray::with_max_entries(1, 0);
 
 // One aggregate virtual clock per rule generation implements bandwidth pacing.
-// LRU retires old generations without invalidating in-flight packets.
+// Userspace retires old generations after atomically publishing new rules.
+// NO_PREALLOC keeps pointers held by in-flight packets valid during retirement.
 #[map]
-static PACE_STATE: LruHashMap<PaceKey, PaceState> = LruHashMap::with_max_entries(MAX_RULES * 4, 0);
+static PACE_STATE: HashMap<PaceKey, PaceState> =
+    HashMap::with_max_entries(MAX_RULES * 4, BPF_F_NO_PREALLOC);
 
 const DUPLICATE_MARK: u32 = 1 << 31;
 const DIAG_SEEN: u32 = 0;
@@ -131,6 +123,8 @@ pub fn faultline_classifier(ctx: TcContext) -> i32 {
 
 fn try_faultline_classifier(ctx: &TcContext) -> Result<i32, i64> {
     let skb = ctx.as_ptr() as *mut __sk_buff;
+    // SAFETY: TcContext owns a valid __sk_buff pointer for the duration of
+    // this classifier invocation; mark is a readable context field.
     let mark = unsafe { (*skb).mark };
     if mark & DUPLICATE_MARK != 0 {
         // A same-interface clone traverses TC again. Clear our private marker
@@ -269,7 +263,10 @@ fn try_faultline_classifier(ctx: &TcContext) -> Result<i32, i64> {
     } else {
         0
     };
+    // SAFETY: Aya constructed ctx from the live __sk_buff supplied by TC;
+    // gso_segs and wire_len are readable context fields for this invocation.
     let gso_segs = unsafe { (*ctx.skb.skb).gso_segs }.max(1);
+    // SAFETY: the same live __sk_buff pointer remains valid through the hook.
     let context_wire_len = unsafe { (*ctx.skb.skb).wire_len };
     let wire_len = if context_wire_len == 0 {
         ctx.len()
@@ -282,7 +279,10 @@ fn try_faultline_classifier(ctx: &TcContext) -> Result<i32, i64> {
     // for the same five-tuple, rule and seed.
     let drop = match rule.loss_algorithm {
         LOSS_ALGORITHM_RANDOM => {
-            should_drop_random_sample(rule.drop_permyriad, unsafe { bpf_get_prandom_u32() })
+            // SAFETY: this BPF helper takes no pointer arguments and is valid
+            // for TC classifier programs.
+            let sample = unsafe { bpf_get_prandom_u32() };
+            should_drop_random_sample(rule.drop_permyriad, sample)
         }
         LOSS_ALGORITHM_HASH => should_drop_hash(flow, packet_index, &rule),
         LOSS_ALGORITHM_GILBERT_ELLIOTT => next_gilbert_elliott_decision(&state_key, &rule),
@@ -478,6 +478,8 @@ fn fragment_key(flow: &FlowKey, packet: &ParsedPacket) -> FragmentKey {
 #[inline(always)]
 fn remember_fragment_ports(flow: &FlowKey, packet: &ParsedPacket, ports: (u16, u16)) {
     let value = FragmentPorts {
+        // SAFETY: this BPF helper takes no pointer arguments and is valid for
+        // TC classifier programs.
         seen_ns: unsafe { bpf_ktime_get_ns() },
         source_port: ports.0,
         destination_port: ports.1,
@@ -489,7 +491,11 @@ fn remember_fragment_ports(flow: &FlowKey, packet: &ParsedPacket, ports: (u16, u
 #[inline(always)]
 fn fragment_ports(flow: &FlowKey, packet: &ParsedPacket) -> Option<(u16, u16)> {
     let key = fragment_key(flow, packet);
+    // SAFETY: FRAGMENT_PORTS uses BPF_F_NO_PREALLOC. A concurrent remove may
+    // unlink this allocation, but the kernel cannot recycle it for another key
+    // while this BPF invocation can still hold the lookup reference.
     let value = *unsafe { FRAGMENT_PORTS.get(key) }?;
+    // SAFETY: this BPF helper takes no pointer arguments and is valid here.
     let now = unsafe { bpf_ktime_get_ns() };
     if fragment_cache_entry_expired(now, value.seen_ns) {
         let _ = FRAGMENT_PORTS.remove(key);
@@ -506,7 +512,10 @@ fn apply_impairments(
     rule: &FaultRule,
     generation: u32,
 ) -> (bool, bool, bool, bool) {
+    // SAFETY: this BPF helper takes no pointer arguments and is valid here.
     let now = unsafe { bpf_ktime_get_ns() };
+    // SAFETY: TcContext contains the live __sk_buff for this invocation and
+    // tstamp is a readable TC context field.
     let existing_tstamp = unsafe { (*(ctx.as_ptr() as *mut __sk_buff)).tstamp };
     let reordered = seeded_hit(
         flow,
@@ -551,10 +560,12 @@ fn apply_impairments(
         delivery
     };
     if delivery > existing_tstamp {
+        // On TC egress __sk_buff.tstamp is the fq delivery time. Direct
+        // context writes retain compatibility with Linux 5.12, which predates
+        // the newer set_tstamp helper.
+        // SAFETY: the pointer is the live TC __sk_buff and tstamp is writable
+        // by a classifier; no pointer or reference escapes this block.
         unsafe {
-            // On TC egress __sk_buff.tstamp is the fq delivery time. Direct
-            // context writes are supported before the newer set_tstamp helper
-            // and keep the base classifier compatible with Linux 5.12.
             (*(ctx.as_ptr() as *mut __sk_buff)).tstamp = delivery;
         }
     }
@@ -562,12 +573,18 @@ fn apply_impairments(
     let mut duplicated = false;
     if duplicate_selected {
         let skb = ctx.as_ptr() as *mut __sk_buff;
+        // SAFETY: skb is the live TC context pointer and mark is readable.
         let mark = unsafe { (*skb).mark };
+        // SAFETY: skb is the live TC context pointer and ifindex is readable.
         let ifindex = unsafe { (*skb).ifindex };
         ctx.set_mark(mark | DUPLICATE_MARK);
+        // SAFETY: tstamp is writable for this live TC context; the temporary
+        // value is restored after clone_redirect.
         unsafe { (*skb).tstamp = duplicate_delivery };
         duplicated = ctx.clone_redirect(ifindex, 0).is_ok();
         ctx.set_mark(mark);
+        // SAFETY: skb remains valid for the classifier invocation and tstamp
+        // is a writable context field.
         unsafe { (*skb).tstamp = delivery };
     }
     // Do not attribute a timestamp supplied by the application/TCP stack to
@@ -599,7 +616,12 @@ fn reserve_delivery_time(
         let _ = PACE_STATE.insert(key, PaceState::default(), BPF_NOEXIST as u64);
     }
     let state = PACE_STATE.get_ptr_mut(key)?;
+    // SAFETY: PACE_STATE uses BPF_F_NO_PREALLOC, so a concurrent remove/update
+    // cannot recycle this allocation for another key while this invocation
+    // holds it. next_ns is naturally aligned and the pointer does not escape.
     let address = unsafe { core::ptr::addr_of_mut!((*state).next_ns) };
+    // SAFETY: address identifies the aligned u64 map field above. Atomic
+    // access is required because the shared map can be updated on other CPUs.
     let mut observed = unsafe {
         core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::Relaxed }>(
             address, 0,
@@ -616,6 +638,8 @@ fn reserve_delivery_time(
             requested
         };
         let next = delivery.saturating_add(serialization);
+        // SAFETY: address remains a valid aligned u64 map field throughout
+        // this verifier-bounded loop.
         let (actual, exchanged) = unsafe {
             core::intrinsics::atomic_cxchg::<
                 u64,
@@ -636,18 +660,22 @@ fn next_packet_index(flow: &FlowStateKey) -> u64 {
     // BPF_NOEXIST makes initialization race-safe: when two CPUs observe a new
     // flow, one insert wins and the other proceeds with the winning entry.
     if FLOW_STATE.get_ptr_mut(flow).is_none() {
-        let state = AtomicFlowState {
+        let state = FlowState {
             packet_index: 0,
             ge_state: 0,
         };
-        let _ = FLOW_STATE.insert(flow, &state, BPF_NOEXIST as u64);
+        let _ = FLOW_STATE.insert(flow, state, BPF_NOEXIST as u64);
     }
     if let Some(state) = FLOW_STATE.get_ptr_mut(flow) {
+        // SAFETY: FLOW_STATE uses BPF_F_NO_PREALLOC, so this allocation cannot
+        // be recycled for another key during the invocation. packet_index is
+        // aligned and its derived address does not escape.
         let address = unsafe { core::ptr::addr_of_mut!((*state).packet_index) };
         // atomic_xadd updates the BPF map correctly but its Rust intrinsic
         // result is not the fetched value on every supported toolchain. Use a
         // zero-add only as an initial hint, then obtain the authoritative old
         // value from cmpxchg. A successful exchange returns a unique index.
+        // SAFETY: address is the valid aligned map field established above.
         let mut observed = unsafe {
             core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::Relaxed }>(
                 address, 0,
@@ -655,6 +683,8 @@ fn next_packet_index(flow: &FlowStateKey) -> u64 {
         };
         for _ in 0..CAS_RETRIES {
             let next = observed.wrapping_add(1);
+            // SAFETY: address remains a valid aligned u64 map field throughout
+            // this verifier-bounded loop.
             let (actual, exchanged) = unsafe {
                 core::intrinsics::atomic_cxchg::<
                     u64,
@@ -670,6 +700,7 @@ fn next_packet_index(flow: &FlowStateKey) -> u64 {
         // Extreme contention may exhaust the verifier-bounded loop. Advance
         // the counter anyway; reusing the last observed index is safer than
         // skipping the configured rule entirely.
+        // SAFETY: address is still the valid aligned packet_index map field.
         unsafe {
             core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::Relaxed }>(
                 address, 1,
@@ -677,9 +708,8 @@ fn next_packet_index(flow: &FlowStateKey) -> u64 {
         }
         observed
     } else {
-        // A concurrent LRU eviction can remove the entry between lookup and
-        // update. Falling back to zero is preferable to passing the packet
-        // without applying the configured loss rule.
+        // The map may be full or a concurrent removal may win. Falling back to
+        // zero is preferable to passing the packet without applying the rule.
         0
     }
 }
@@ -691,11 +721,11 @@ const GE_TIME_MASK: u64 = u32::MAX as u64;
 #[inline(always)]
 fn next_gilbert_elliott_decision(key: &FlowStateKey, rule: &FaultRule) -> bool {
     if FLOW_STATE.get_ptr_mut(key).is_none() {
-        let state = AtomicFlowState {
+        let state = FlowState {
             packet_index: 0,
             ge_state: 0,
         };
-        let _ = FLOW_STATE.insert(key, &state, BPF_NOEXIST as u64);
+        let _ = FLOW_STATE.insert(key, state, BPF_NOEXIST as u64);
     }
     let Some(state) = FLOW_STATE.get_ptr_mut(key) else {
         return false;
@@ -705,8 +735,13 @@ fn next_gilbert_elliott_decision(key: &FlowStateKey, rule: &FaultRule) -> bool {
     // Seconds are sufficient for idle reset and leave 31 bits for the packet
     // sequence. Both counters intentionally wrap; wrapping subtraction keeps
     // idle comparisons valid for intervals shorter than half their range.
+    // SAFETY: this BPF helper takes no pointer arguments and is valid for TC.
     let now_secs = unsafe { bpf_ktime_get_ns() / 1_000_000_000 } & GE_TIME_MASK;
+    // SAFETY: FLOW_STATE uses BPF_F_NO_PREALLOC, so this allocation cannot be
+    // recycled for another key during the invocation. ge_state is aligned and
+    // the derived pointer does not escape.
     let address = unsafe { core::ptr::addr_of_mut!((*state).ge_state) };
+    // SAFETY: address identifies the valid aligned map field established above.
     let mut observed = unsafe {
         core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::Relaxed }>(
             address, 0,
@@ -731,6 +766,8 @@ fn next_gilbert_elliott_decision(key: &FlowStateKey, rule: &FaultRule) -> bool {
         let next = ((next_bad as u64) << 63)
             | ((now_secs & GE_TIME_MASK) << 31)
             | (sequence.wrapping_add(1) & GE_SEQUENCE_MASK);
+        // SAFETY: address remains a valid aligned u64 map field throughout
+        // this verifier-bounded loop.
         let (actual, exchanged) = unsafe {
             core::intrinsics::atomic_cxchg::<
                 u64,
@@ -761,9 +798,9 @@ fn update_stats(
     pacing_dropped: bool,
 ) {
     if let Some(stats) = STATS.get_ptr_mut(rule_id) {
+        // SAFETY: get_ptr_mut returned a live RuleStats map value. STATS is
+        // per-CPU, so these non-atomic writes cannot race with another CPU.
         unsafe {
-            // STATS is per-CPU, so these non-atomic writes cannot race with an
-            // update performed by the same program on another CPU.
             (*stats).matched = (*stats).matched.wrapping_add(1);
             (*stats).matched_segments = (*stats).matched_segments.wrapping_add(segments as u64);
             (*stats).matched_bytes = (*stats).matched_bytes.wrapping_add(bytes as u64);
@@ -794,6 +831,8 @@ fn update_stats(
 #[inline(always)]
 fn update_diagnostic(reason: u32) {
     if let Some(stats) = DIAGNOSTICS.get_ptr_mut(0) {
+        // SAFETY: get_ptr_mut returned a live DiagnosticStats map value and
+        // DIAGNOSTICS is per-CPU, so these non-atomic writes cannot race.
         unsafe {
             match reason {
                 DIAG_SEEN => (*stats).seen = (*stats).seen.wrapping_add(1),
@@ -827,7 +866,9 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
+// SAFETY: this eBPF binary defines the sole `LICENSE` export, and the kernel
+// loader requires its NUL-terminated declaration in the `license` ELF section.
+// The value stays aligned with the crate's source license.
 #[unsafe(link_section = "license")]
 #[unsafe(no_mangle)]
-// Keep this loader-visible declaration aligned with the crate's source license.
 static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";

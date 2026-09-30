@@ -213,6 +213,8 @@ async fn main() -> anyhow::Result<()> {
     let mut control = ControlChannel::for_rules(initial_rules.clone());
     let mut rules = RuleStore::new(
         ebpf.take_map("RULES").context("RULES map not found")?,
+        ebpf.take_map("FLOW_STATE")
+            .context("FLOW_STATE map not found")?,
         ebpf.take_map("PACE_STATE")
             .context("PACE_STATE map not found")?,
     )?;
@@ -612,6 +614,8 @@ fn raise_memlock_limit() {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
     };
+    // SAFETY: limit points to a fully initialized rlimit for the duration of
+    // the call, and RLIMIT_MEMLOCK is a valid resource selector.
     let result = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) };
     if result != 0 {
         debug!("failed to remove locked-memory limit: {result}");

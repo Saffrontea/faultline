@@ -32,7 +32,7 @@ run = "cargo clippy --workspace --all-targets --exclude faultline-ebpf -- -D war
 
 [tasks.lint-ebpf]
 description = "Run Clippy for the eBPF program with its nightly target"
-run = "cargo +nightly clippy -Z build-std=core --target bpfel-unknown-none -p faultline-ebpf --bin flt -- -D warnings"
+run = "cargo +nightly clippy -Z build-std=core --target bpfel-unknown-none -p faultline-ebpf --bin faultline -- -D warnings"
 
 [tasks.lint]
 description = "Run userspace and eBPF Clippy checks"
@@ -90,7 +90,7 @@ fi
 '''
 
 [tasks."lab:lru"]
-description = "Exercise LRU capacity, eviction, reinsertion, and counter boundaries in the kernel"
+description = "Exercise safe state-map capacity and counter boundaries in the kernel"
 depends = ["build", "lab:up"]
 run = '''
 build_output=$(cargo test -p faultline-engine --test lru_boundaries --no-run 2>&1)

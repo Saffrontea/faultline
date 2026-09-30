@@ -6,9 +6,9 @@ use aya::maps::{
     lpm_trie::{Key, LpmTrie},
 };
 use faultline_common::{
-    ADDRESS_FAMILY_IPV4, ADDRESS_FAMILY_IPV6, FaultRule, MAX_RULE_MAP_ENTRIES, MAX_RULES, PaceKey,
-    PaceState, RULE_NAMESPACE_SOURCE_V4, RULE_NAMESPACE_SOURCE_V6, RULE_NODE_DESTINATION,
-    RULE_NODE_SOURCE, RuleNode,
+    ADDRESS_FAMILY_IPV4, ADDRESS_FAMILY_IPV6, FaultRule, FlowState, FlowStateKey,
+    MAX_RULE_MAP_ENTRIES, MAX_RULES, PaceKey, PaceState, RULE_NAMESPACE_SOURCE_V4,
+    RULE_NAMESPACE_SOURCE_V6, RULE_NODE_DESTINATION, RULE_NODE_SOURCE, RuleNode,
 };
 use faultline_protocol::RuleSpec;
 use ipnet::IpNet;
@@ -19,15 +19,17 @@ type GroupedRules = BTreeMap<IpNet, Vec<(Option<IpNet>, FaultRule)>>;
 
 pub struct RuleStore {
     rules: ArrayOfMaps<MapData, LpmTrie<MapData, [u8; 24], RuleNode>>,
+    flow_state: HashMap<MapData, FlowStateKey, FlowState>,
     pace_state: HashMap<MapData, PaceKey, PaceState>,
     active_rule_ids: Vec<u32>,
     generation: u32,
 }
 
 impl RuleStore {
-    pub fn new(rules: Map, pace_state: Map) -> anyhow::Result<Self> {
+    pub fn new(rules: Map, flow_state: Map, pace_state: Map) -> anyhow::Result<Self> {
         Ok(Self {
             rules: ArrayOfMaps::try_from(rules)?,
+            flow_state: HashMap::try_from(flow_state)?,
             pace_state: HashMap::try_from(pace_state)?,
             active_rule_ids: Vec::new(),
             generation: 0,
@@ -100,6 +102,29 @@ impl RuleStore {
         self.rules
             .set(0, &next, 0)
             .context("publishing the BPF rule generation")?;
+
+        // FLOW_STATE has the same lifetime rule as PACE_STATE. Collect before
+        // mutating because Aya's key iterator borrows the map immutably.
+        let stale_flow_keys: Vec<_> = self
+            .flow_state
+            .keys()
+            .filter_map(Result::ok)
+            .filter(|key| key.generation == self.generation)
+            .collect();
+        for key in stale_flow_keys {
+            let _ = self.flow_state.remove(&key);
+        }
+
+        // PACE_STATE is a non-preallocated hash map: removing an old entry
+        // cannot make an in-flight lookup pointer alias a new key. Retire the
+        // preceding generation only after publication, so packets that began
+        // under the old inner map can finish against their unlinked allocation.
+        for &rule_id in &self.active_rule_ids {
+            let _ = self.pace_state.remove(&PaceKey {
+                rule_id,
+                generation: self.generation,
+            });
+        }
         self.generation = generation;
         self.active_rule_ids = rule_ids.into_iter().collect();
         self.active_rule_ids.sort_unstable();

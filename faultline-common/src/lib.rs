@@ -245,6 +245,21 @@ pub struct FlowKey {
     pub _padding: [u8; 2],
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct FlowStateKey {
+    pub flow: FlowKey,
+    pub rule_id: u32,
+    pub generation: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct FlowState {
+    pub packet_index: u64,
+    pub ge_state: u64,
+}
+
 /// Returns whether a packet should be dropped for a rule.
 ///
 /// The result depends only on the flow, packet index, and rule, making an
@@ -330,18 +345,36 @@ fn deterministic_bucket(flow: &FlowKey, packet_index: u64, rule: &FaultRule, dom
 }
 
 #[cfg(feature = "user")]
+// SAFETY: FaultRule has a stable C layout and contains only integer POD fields;
+// its explicit padding is initialized by every constructor and Default.
 unsafe impl aya::Pod for FaultRule {}
 #[cfg(feature = "user")]
+// SAFETY: RuleStats is repr(C) and every field is a u64, so every bit pattern
+// is valid and the kernel/user-space byte representation is stable.
 unsafe impl aya::Pod for RuleStats {}
 #[cfg(feature = "user")]
+// SAFETY: DiagnosticStats is repr(C) and consists exclusively of u64 counters.
 unsafe impl aya::Pod for DiagnosticStats {}
 #[cfg(feature = "user")]
+// SAFETY: FlowKey has a stable C layout, integer fields, and explicit padding;
+// all possible field bit patterns are valid.
 unsafe impl aya::Pod for FlowKey {}
 #[cfg(feature = "user")]
+// SAFETY: FlowStateKey is repr(C) and consists of the Pod-compatible FlowKey
+// followed by two u32 fields.
+unsafe impl aya::Pod for FlowStateKey {}
+#[cfg(feature = "user")]
+// SAFETY: FlowState is repr(C) and consists exclusively of u64 fields.
+unsafe impl aya::Pod for FlowState {}
+#[cfg(feature = "user")]
+// SAFETY: RuleNode is repr(C) and is composed only of Pod-compatible integer
+// fields, explicit padding, and FaultRule.
 unsafe impl aya::Pod for RuleNode {}
 #[cfg(feature = "user")]
+// SAFETY: PaceState is repr(C) and contains one u64 value.
 unsafe impl aya::Pod for PaceState {}
 #[cfg(feature = "user")]
+// SAFETY: PaceKey is repr(C) and contains two u32 values.
 unsafe impl aya::Pod for PaceKey {}
 
 #[cfg(test)]
@@ -469,6 +502,14 @@ mod tests {
         assert_eq!(core::mem::align_of::<FaultRule>(), 8);
         assert_eq!(core::mem::size_of::<RuleNode>(), 120);
         assert_eq!(core::mem::align_of::<RuleNode>(), 8);
+    }
+
+    #[test]
+    fn flow_state_abi_matches_the_shared_bpf_map_layout() {
+        assert_eq!(core::mem::size_of::<FlowKey>(), 40);
+        assert_eq!(core::mem::size_of::<FlowStateKey>(), 48);
+        assert_eq!(core::mem::size_of::<FlowState>(), 16);
+        assert_eq!(core::mem::align_of::<FlowState>(), 8);
     }
 
     #[test]

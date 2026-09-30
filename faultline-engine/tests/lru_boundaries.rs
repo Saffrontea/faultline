@@ -2,19 +2,20 @@ use std::{mem::size_of, net::Ipv4Addr};
 
 use aya::{
     maps::{
-        ArrayOfMaps, HashMap, MapData,
+        ArrayOfMaps, HashMap, Map, MapData, MapType,
         lpm_trie::{Key, LpmTrie},
     },
     programs::{SchedClassifier, TestRun, TestRunOptions},
 };
 use faultline_common::{
-    ADDRESS_FAMILY_IPV4, FaultRule, FlowKey, LOSS_ALGORITHM_HASH, PROTOCOL_TCP, PaceKey, PaceState,
-    RULE_NAMESPACE_SOURCE_V4, RULE_NODE_DESTINATION, RULE_NODE_SOURCE, RuleNode,
-    serialization_delay_ns, should_drop_hash,
+    ADDRESS_FAMILY_IPV4, FaultRule, FlowKey, FlowState, FlowStateKey, LOSS_ALGORITHM_HASH,
+    PROTOCOL_TCP, PaceKey, PaceState, RULE_NAMESPACE_SOURCE_V4, RULE_NODE_DESTINATION,
+    RULE_NODE_SOURCE, RuleNode, serialization_delay_ns, should_drop_hash,
 };
 
 const TC_ACT_PIPE: u32 = 3;
 const TC_ACT_SHOT: u32 = 2;
+const BPF_F_NO_PREALLOC: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -59,7 +60,8 @@ const _: () = assert!(size_of::<SkbContext>() == 192);
 
 impl SkbContext {
     fn as_bytes(&self) -> &[u8] {
-        // `SkbContext` is the initialized, fixed-layout __sk_buff test ABI.
+        // SAFETY: SkbContext is the initialized, fixed-layout __sk_buff test
+        // ABI, and the returned slice cannot outlive this shared reference.
         unsafe {
             std::slice::from_raw_parts(std::ptr::from_ref(self).cast::<u8>(), size_of::<Self>())
         }
@@ -67,24 +69,15 @@ impl SkbContext {
 
     fn read_from(bytes: &[u8]) -> anyhow::Result<Self> {
         anyhow::ensure!(bytes.len() >= size_of::<Self>(), "short skb context");
+        // SAFETY: the size check guarantees a complete SkbContext, every bit
+        // pattern is valid for its integer fields, and read_unaligned removes
+        // any alignment requirement on the byte buffer.
         Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<Self>()) })
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TestFlowStateKey {
-    flow: FlowKey,
-    rule_id: u32,
-    generation: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct TestFlowState {
-    packet_index: u64,
-    ge_state: u64,
-}
+type TestFlowStateKey = FlowStateKey;
+type TestFlowState = FlowState;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,9 +99,9 @@ struct TestFragmentPorts {
     padding: [u8; 4],
 }
 
-unsafe impl aya::Pod for TestFlowStateKey {}
-unsafe impl aya::Pod for TestFlowState {}
+// SAFETY: the C-layout key contains only integer arrays and integer fields.
 unsafe impl aya::Pod for TestFragmentKey {}
+// SAFETY: the C-layout value contains integer fields and explicit padding.
 unsafe impl aya::Pod for TestFragmentPorts {}
 
 type Rules = ArrayOfMaps<MapData, LpmTrie<MapData, [u8; 24], RuleNode>>;
@@ -125,7 +118,7 @@ struct Maps {
 
 #[test]
 #[ignore = "requires root or CAP_BPF and BPF_PROG_TEST_RUN context support"]
-fn flow_state_lru_handles_minimum_full_and_over_capacity() -> anyhow::Result<()> {
+fn flow_state_full_map_does_not_evict_or_alias_another_flow() -> anyhow::Result<()> {
     for capacity in [1, 2] {
         let (mut ebpf, mut maps) = load(capacity, 4, 4)?;
         let rule = hash_rule();
@@ -143,20 +136,28 @@ fn flow_state_lru_handles_minimum_full_and_over_capacity() -> anyhow::Result<()>
 
         let (overflow_flow, overflow_packet) =
             flow_and_packet(30_000 + capacity as u16, 0x2000 + capacity as u16);
-        run(program, &overflow_packet, &SkbContext::default())?;
+        let action = run(program, &overflow_packet, &SkbContext::default())?;
+        let expected = if should_drop_hash(&overflow_flow, 0, &rule) {
+            TC_ACT_SHOT
+        } else {
+            TC_ACT_PIPE
+        };
+        assert_eq!(
+            action, expected,
+            "an untracked flow still uses sequence zero"
+        );
         assert_eq!(map_len(&maps.flows)?, capacity as usize);
-        assert_eq!(flow_state(&maps.flows, overflow_flow, 1)?.packet_index, 1);
+        assert!(
+            flow_state(&maps.flows, overflow_flow, 1).is_err(),
+            "a full non-preallocated map must not recycle an existing slot"
+        );
 
-        let evicted = original
-            .iter()
-            .find(|(flow, _)| flow_state(&maps.flows, *flow, 1).is_err())
-            .expect("overflow must evict one prior flow");
-        run(program, &evicted.1, &SkbContext::default())?;
+        run(program, &original[0].1, &SkbContext::default())?;
         assert_eq!(map_len(&maps.flows)?, capacity as usize);
         assert_eq!(
-            flow_state(&maps.flows, evicted.0, 1)?.packet_index,
-            1,
-            "an evicted flow must restart at sequence zero and remain impaired"
+            flow_state(&maps.flows, original[0].0, 1)?.packet_index,
+            2,
+            "overflow must not replace or modify the existing flow's state"
         );
     }
     Ok(())
@@ -196,7 +197,7 @@ fn flow_sequence_wraps_at_u64_boundary() -> anyhow::Result<()> {
 
 #[test]
 #[ignore = "requires root or CAP_BPF and BPF_PROG_TEST_RUN context support"]
-fn fragment_lru_evicts_at_capacity_and_keeps_newest_ports() -> anyhow::Result<()> {
+fn fragment_full_map_does_not_reuse_another_datagrams_ports() -> anyhow::Result<()> {
     let (mut ebpf, mut maps) = load(4, 1, 1)?;
     let rule = FaultRule {
         drop_permyriad: 10_000,
@@ -218,17 +219,21 @@ fn fragment_lru_evicts_at_capacity_and_keeps_newest_ports() -> anyhow::Result<()
     assert_eq!(map_len(&maps.fragments)?, 1);
     assert_eq!(
         run(program, &later_a, &SkbContext::default())?,
-        TC_ACT_PIPE,
-        "the evicted fragment ID must not inherit another datagram's ports"
+        TC_ACT_SHOT,
+        "overflow must not evict the existing fragment entry"
     );
-    assert_eq!(run(program, &later_b, &SkbContext::default())?, TC_ACT_SHOT);
+    assert_eq!(
+        run(program, &later_b, &SkbContext::default())?,
+        TC_ACT_PIPE,
+        "an unrecorded fragment must not inherit another datagram's ports"
+    );
     assert_eq!(map_len(&maps.fragments)?, 1);
     Ok(())
 }
 
 #[test]
 #[ignore = "requires root or CAP_BPF and BPF_PROG_TEST_RUN context support"]
-fn pacing_lru_restarts_clock_after_generation_eviction() -> anyhow::Result<()> {
+fn pacing_full_map_fails_closed_without_reusing_another_generation() -> anyhow::Result<()> {
     let (mut ebpf, mut maps) = load(8, 1, 1)?;
     let rule = FaultRule {
         drop_permyriad: 0,
@@ -259,26 +264,42 @@ fn pacing_lru_restarts_clock_after_generation_eviction() -> anyhow::Result<()> {
 
     maps.rules.set(0, &build_rules(rule, 2)?, 0)?;
     assert_eq!(
-        run_with_context(program, &packet, &context)?.1.tstamp,
-        requested
+        run_with_context(program, &packet, &context)?.0,
+        TC_ACT_SHOT,
+        "a full pacing map must fail closed rather than update another generation"
+    );
+    assert_eq!(
+        maps.pace
+            .get(
+                &PaceKey {
+                    rule_id: rule.id,
+                    generation: 1,
+                },
+                0,
+            )?
+            .next_ns,
+        requested + serialization * 2,
+        "the existing generation's clock must remain unchanged"
     );
     assert!(
         maps.pace
             .get(
                 &PaceKey {
                     rule_id: rule.id,
-                    generation: 1
+                    generation: 2,
                 },
-                0
+                0,
             )
-            .is_err()
+            .is_err(),
+        "the overflowing generation must not be inserted"
     );
+    assert_eq!(map_len(&maps.pace)?, 1);
 
     maps.rules.set(0, &build_rules(rule, 1)?, 0)?;
     assert_eq!(
         run_with_context(program, &packet, &context)?.1.tstamp,
-        requested,
-        "an evicted generation must start with an empty pacing clock"
+        requested + serialization * 2,
+        "overflow must not replace or reset the existing generation's clock"
     );
     assert_eq!(map_len(&maps.pace)?, 1);
     Ok(())
@@ -298,6 +319,18 @@ fn load(
         env!("OUT_DIR"),
         "/faultline"
     )))?;
+    for name in ["FLOW_STATE", "FRAGMENT_PORTS", "PACE_STATE"] {
+        let Map::HashMap(data) = ebpf.map(name).expect("state map") else {
+            panic!("{name} must be a hash map");
+        };
+        let info = data.info()?;
+        assert_eq!(info.map_type()?, MapType::Hash, "{name} must not be LRU");
+        assert_ne!(
+            info.map_flags() & BPF_F_NO_PREALLOC,
+            0,
+            "{name} must set BPF_F_NO_PREALLOC"
+        );
+    }
     let maps = Maps {
         rules: ArrayOfMaps::try_from(ebpf.take_map("RULES").expect("RULES map"))?,
         flows: HashMap::try_from(ebpf.take_map("FLOW_STATE").expect("FLOW_STATE map"))?,

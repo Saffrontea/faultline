@@ -12,10 +12,10 @@ use aya::{
     programs::{SchedClassifier, TestRun, TestRunOptions},
 };
 use faultline_common::{
-    ADDRESS_FAMILY_IPV4, ADDRESS_FAMILY_IPV6, FaultRule, FlowKey, LOSS_ALGORITHM_GILBERT_ELLIOTT,
-    LOSS_ALGORITHM_HASH, LOSS_ALGORITHM_RANDOM, PROTOCOL_TCP, RULE_NAMESPACE_SOURCE_V4,
-    RULE_NAMESPACE_SOURCE_V6, RULE_NODE_DESTINATION, RULE_NODE_SOURCE, RuleNode, RuleStats,
-    gilbert_elliott_step, should_drop_hash,
+    ADDRESS_FAMILY_IPV4, ADDRESS_FAMILY_IPV6, FaultRule, FlowKey, FlowState, FlowStateKey,
+    LOSS_ALGORITHM_GILBERT_ELLIOTT, LOSS_ALGORITHM_HASH, LOSS_ALGORITHM_RANDOM, PROTOCOL_TCP,
+    RULE_NAMESPACE_SOURCE_V4, RULE_NAMESPACE_SOURCE_V6, RULE_NODE_DESTINATION, RULE_NODE_SOURCE,
+    RuleNode, RuleStats, gilbert_elliott_step, should_drop_hash,
 };
 
 const TC_ACT_PIPE: u32 = 3;
@@ -65,9 +65,9 @@ const _: () = assert!(size_of::<SkbContext>() == 192);
 
 impl SkbContext {
     fn as_bytes(&self) -> &[u8] {
-        // `SkbContext` mirrors the kernel's fixed `__sk_buff` test-run ABI.
+        // SAFETY: SkbContext mirrors the kernel's fixed __sk_buff test-run ABI.
         // `repr(C)` fixes field layout and every byte belongs to initialized
-        // integer fields, so exposing that representation is sound.
+        // integer fields; the slice cannot outlive the shared reference.
         unsafe {
             std::slice::from_raw_parts(std::ptr::from_ref(self).cast::<u8>(), size_of::<Self>())
         }
@@ -79,7 +79,7 @@ impl SkbContext {
             "kernel returned a short skb context: {}",
             bytes.len()
         );
-        // The byte buffer has no `SkbContext` alignment guarantee; the size
+        // SAFETY: the byte buffer has no SkbContext alignment guarantee; the size
         // check above and the fixed POD layout make an unaligned copy valid.
         Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<Self>()) })
     }
@@ -96,23 +96,8 @@ struct Totals {
     gso_skbs: u64,
 }
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct TestFlowStateKey {
-    flow: FlowKey,
-    rule_id: u32,
-    generation: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-struct TestFlowState {
-    packet_index: u64,
-    ge_state: u64,
-}
-
-unsafe impl aya::Pod for TestFlowStateKey {}
-unsafe impl aya::Pod for TestFlowState {}
+type TestFlowStateKey = FlowStateKey;
+type TestFlowState = FlowState;
 
 #[test]
 #[ignore = "requires root or CAP_BPF and BPF_PROG_TEST_RUN context support"]
